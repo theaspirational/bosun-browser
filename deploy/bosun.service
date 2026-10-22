@@ -1,0 +1,66 @@
+; Example systemd unit for Bosun (see docs/DEPLOY-SYSTEMD.md). Copy to /etc/systemd/system/bosun.service and
+; adjust the paths. No secrets belong in this file: they live in /etc/bosun/bosun.env (root:bosun, 0640).
+
+[Unit]
+Description=Bosun browser for agents (MCP over WebSocket, live-view handoff)
+Documentation=https://github.com/The-Glassy/bosun-browser
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bosun
+Group=bosun
+WorkingDirectory=/opt/bosun
+
+; Tokens, listeners, host allowlist and feature switches. Not world-readable, not in the repository.
+EnvironmentFile=/etc/bosun/bosun.env
+Environment=HOME=/var/lib/bosun
+Environment=BROWSER_DATA=/var/lib/bosun/data
+Environment=PLAYWRIGHT_BROWSERS_PATH=/var/lib/bosun/pw-browsers
+Environment=NODE_ENV=production
+
+; Headful Chromium on a private X display: fewer bot flags than headless, and meetings would need it anyway.
+ExecStart=/usr/bin/xvfb-run -a -s "-screen 0 1366x900x24 -nolisten tcp" /usr/bin/node /opt/bosun/src/server.mjs
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+KillMode=mixed
+; Chromium spawns many threads; the default TasksMax (~15% of the system maximum) is easy to hit.
+TasksMax=2000
+; Rough ceiling for 3 concurrent headful sessions. Raise with MAX_SESSIONS, don't let the box swap.
+MemoryMax=6G
+MemoryAccounting=yes
+
+; Chromium's own sandbox is on (CHROMIUM_SANDBOX defaults to 1) and startup refuses to run without it. It needs
+; unprivileged user namespaces, or an AppArmor profile granting "userns", or the setuid helper — see
+; docs/DEPLOY-SYSTEMD.md §3a. For the setuid-helper route, uncomment the next line AND drop NoNewPrivileges below.
+;Environment=CHROME_DEVEL_SANDBOX=/var/lib/bosun/pw-browsers/chromium-<build>/chrome-linux64/chrome_sandbox
+
+; --- hardening (this bounds the service user; the renderer's own sandbox is above) ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/bosun
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RemoveIPC=yes
+; Chromium needs AF_NETLINK (network-change notifications) besides the usual families.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+; Deliberately NOT set: SystemCallFilter / MemoryDenyWriteExecute / RestrictNamespaces / PrivateUsers — Chromium's
+; own sandbox needs clone(), unshare(), user namespaces and JIT pages; filtering them makes the browser fail to
+; start, which is now a startup error rather than a silent downgrade.
+; Bosun finds and kills leftover browser processes by reading `ps`, so keep its own children visible: do not add
+; PrivatePIDs=yes.
+
+[Install]
+WantedBy=multi-user.target

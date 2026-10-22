@@ -72,7 +72,14 @@ test('token from Authorization header is preferred over ?token=', () => {
 
 function run(env, waitFor) {
   return new Promise((resolve) => {
-    const p = spawn(process.execPath, [SERVER], { env: { PATH: process.env.PATH, HOME: process.env.HOME, BROWSER_DATA: tmpDir(), HEADLESS: '1', ...env }, stdio: ['pipe', 'pipe', 'pipe'] });
+    // CHROMIUM_SANDBOX=0 because these are configuration tests: startup otherwise launches the browser once to
+    // prove its sandbox works, which a container or CI box usually cannot (that path is covered in
+    // features.test.mjs). LD_LIBRARY_PATH comes along for hosts where the browser's libraries are not in the
+    // default search path.
+    const p = spawn(process.execPath, [SERVER], {
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, LD_LIBRARY_PATH: process.env.LD_LIBRARY_PATH || '', BROWSER_DATA: tmpDir(), HEADLESS: '1', CHROMIUM_SANDBOX: '0', ...env },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
     let err = '';
     const done = (code) => { clearTimeout(t); resolve({ code, err }); };
     p.stderr.on('data', (d) => { err += d; if (waitFor && waitFor.test(err)) { p.kill('SIGTERM'); } });

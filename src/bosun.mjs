@@ -23,7 +23,8 @@ export async function startService(cfg, { engines, keepalive: kaOpts = {}, meeti
   let keepalive;
   try {
     keepalive = manager.keepalive = new Keepalive({ cfg, manager, wall, emit: (e) => events.needsHuman(e), onWatch: (e) => events.watchChanged(e), ...kaOpts });
-    manager.meetings = new Meetings({ cfg, manager, bus: events, ...mOpts });
+    // Fork: meetings are off unless FEATURES_MEETINGS=1 — no tools, no handlers, no recordings directory.
+    if (cfg.features.meetings) manager.meetings = new Meetings({ cfg, manager, bus: events, ...mOpts });
   } catch (e) { await live?.close(); throw e; }
   if (cfg.keepalive) keepalive.start();
   const ws = cfg.ws ? await startWsServer({ cfg, manager }) : null;
@@ -32,15 +33,19 @@ export async function startService(cfg, { engines, keepalive: kaOpts = {}, meeti
   const shutdown = () => (closing ??= (async () => {
     // Stop admission first, then tear down handoffs and sessions (each close is deadline-bounded).
     manager.closing = true;
-    await Promise.allSettled([keepalive.stop(), manager.meetings.stop()]);
+    await Promise.allSettled([keepalive.stop(), manager.meetings?.stop()]);
     await Promise.allSettled([ws?.close(), live?.close()]);
     await manager.closeAll();
   })());
-  return { cfg, live, manager, ws, keepalive, events, meetings: manager.meetings, shutdown };
+  return { cfg, live, manager, ws, keepalive, events, meetings: manager.meetings ?? null, shutdown };
 }
 
 export async function main(env = process.env) {
   const cfg = loadConfig(env);
+  // Never silent: an unsandboxed browser is said out loud at every start.
+  if (!cfg.chromiumSandbox && cfg.engine !== 'camoufox') {
+    console.error('bosun: WARNING — CHROMIUM_SANDBOX=0: the browser runs without its own sandbox, so a renderer that is compromised by a page lands directly on this user');
+  }
   const svc = await startService(cfg);
   const exit = (code) => {
     const force = setTimeout(() => process.exit(1), 20_000);

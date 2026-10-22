@@ -3,7 +3,6 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { countNodes, maskText, maskedScreenshot, sensitiveValues } from './redact.mjs';
 import { NOT_ALLOWED, PROFILES_REFUSED, TENANT_RE } from './auth.mjs';
-import { ENGINE_NAMES } from './engines.mjs';
 import { urlKey, httpUrl } from './sessions.mjs';
 
 export { httpUrl };
@@ -86,6 +85,9 @@ export const EPHEMERAL_TOOLS = new Set(['session_open', 'session_close', 'naviga
 
 export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn = { inflight: 0 } }) {
   const ephemeral = policy === 'ephemeral';
+  // Fork: when this tenant has a host allowlist, say so in the tool description instead of letting the agent guess.
+  const allowed = manager.allowList(tenant);
+  const allowNote = allowed ? `This token may only reach: ${allowed.map((p) => (p.any ? '*' : `${p.wild ? '*.' : ''}${p.host}${p.port ? `:${p.port}` : ''}`)).join(', ')}.` : null;
   const server = new McpServer({ name: 'bosun', version: '0.7.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
@@ -121,7 +123,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
 
   tool('session_open', ephemeral ? `Open an ephemeral browser session (wiped on close). Profiles, and engines other than ${cfg.engine}, are not allowed for this token.` : 'Open a browser session. Without profile: ephemeral (wiped on close). With profile: persistent per-tenant profile (stays logged in).',
     { profile: z.string().regex(TENANT_RE).optional(), locale: str(35).optional(), timezone: str(64).optional(),
-      engine: z.enum(ENGINE_NAMES).optional().describe(`browser engine (default ${cfg.engine}): chromium, patchright (stealthier Chromium), camoufox (anti-detect Firefox)`) },
+      engine: z.enum(cfg.engines).optional().describe(`browser engine (default ${cfg.engine}); enabled here: ${cfg.engines.join(', ')}`) },
     async (a) => {
       if (ephemeral && a.profile !== undefined) throw new Error(PROFILES_REFUSED);
       if (ephemeral && a.engine && a.engine !== cfg.engine) throw new Error(`engine ${a.engine} is ${NOT_ALLOWED}; use the default (${cfg.engine})`);
@@ -134,13 +136,16 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     return ok({ closed: session });
   });
 
-  tool('navigate', 'Go to a URL (http/https only).', { session: str(40), url: z.string().max(4096).url(), wait: z.enum(['load', 'domcontentloaded', 'networkidle']).optional() }, async (a) => {
-    const url = httpUrl(a.url);
+  tool('navigate', allowNote ? `Go to a URL (http/https only). ${allowNote}` : 'Go to a URL (http/https only).', { session: str(40), url: z.string().max(4096).url(), wait: z.enum(['load', 'domcontentloaded', 'networkidle']).optional() }, async (a) => {
+    const url = manager.checkAllowed(tenant, httpUrl(a.url));
     return run(a.session, async (s) => {
       const r = await s.page.goto(url, { waitUntil: a.wait || 'domcontentloaded', timeout: 45000 });
       await s.page.waitForTimeout(1200);
       const w = noteWall(s, await wall(s.page));
-      return ok({ status: r?.status(), ...(await pageInfo(s.page)), ...(w ? { blocked: w, hint: 'call request_human to let a person solve it' } : {}) });
+      const info = await pageInfo(s.page);
+      // The browser follows redirects itself; one that left the allowlist got the tenant proxy's refusal instead.
+      const refused = r?.status() === 403 && !manager.isAllowed(tenant, info.url);
+      return ok({ status: r?.status(), ...info, ...(refused ? { refused: 'host allowlist' } : {}), ...(w ? { blocked: w, hint: 'call request_human to let a person solve it' } : {}) });
     });
   });
 
@@ -277,7 +282,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       { url: z.string().max(2048).url().describe('https://meet.google.com/abc-defg-hij'), name: str(60).optional().describe('display name (default "Glassy (notetaker)")'),
         announce_text: str(1000).optional(), max_wait_admit_min: z.number().int().min(1).max(60).optional(),
         profile: z.string().regex(TENANT_RE).optional().describe('join with an existing Bosun profile signed in to Google (gets refused less often than an anonymous guest)'),
-        engine: z.enum(ENGINE_NAMES).optional().describe('chromium (default) or patchright; camoufox is not supported for meetings'),
+        engine: z.enum(cfg.engines).optional().describe('chromium (default) or patchright; camoufox is not supported for meetings'),
         leave_on_optout: z.boolean().optional() },
       async (a) => ok(await meetings.join(tenant, {
         url: a.url, name: a.name || 'Glassy (notetaker)', announceText: a.announce_text, maxWaitAdmitMin: a.max_wait_admit_min ?? 10,

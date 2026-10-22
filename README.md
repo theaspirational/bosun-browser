@@ -6,6 +6,15 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 > Status: **prototype (M0)**. Works end to end in one deployment; APIs will change. See [docs/DESIGN.md](docs/DESIGN.md)
 > and [CHANGELOG.md](CHANGELOG.md).
 
+> **This is a fork.** It adds a [per-tenant host allowlist](#per-tenant-host-allowlist)
+> (`BROWSER_TENANT_ALLOW`), enforced by a forward proxy inside the service that is the browser's only way out, runs
+> Chromium **with its own sandbox** ([`CHROMIUM_SANDBOX`](#chromium-sandbox)), and
+> turns three things off by default: meetings (`FEATURES_MEETINGS=0`), every engine but `chromium`
+> (`FEATURES_ENGINES=chromium`) and downloads (`DOWNLOADS=0`). It also ships a Linux deployment guide
+> ([docs/DEPLOY-SYSTEMD.md](docs/DEPLOY-SYSTEMD.md)). What was reviewed before adopting it, and what is still risky,
+> is written down in [docs/FORK-SECURITY-REVIEW.md](docs/FORK-SECURITY-REVIEW.md). Nothing else was removed, so
+> upstream merges stay easy: the switches are configuration, not deletions.
+
 ## What it does today
 
 - Headful Chromium (Playwright) under Xvfb — fewer bot flags than headless.
@@ -15,8 +24,9 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 - MCP server over **stdio** (Claude Code, Codex, …) or **WebSocket** (shared service).
 - Tools: `session_open` / `session_close` / `sessions`, `navigate`, `read` (accessibility snapshot with element
   refs), `click`, `type`, `select`, `press`, `back`, `wait_for`, `screenshot`, `request_human`, `handoff_wait`,
-  `keepalive_set` / `keepalive_list` / `keepalive_remove`, `meeting_join` / `meeting_status` / `meeting_chat_read` /
-  `meeting_chat_send` / `meeting_stop_recording` / `meeting_leave` / `meeting_recording_delete`.
+  `keepalive_set` / `keepalive_list` / `keepalive_remove`, and — with `FEATURES_MEETINGS=1`, off by default in this
+  fork — `meeting_join` / `meeting_status` / `meeting_chat_read` / `meeting_chat_send` / `meeting_stop_recording` /
+  `meeting_leave` / `meeting_recording_delete`.
 - **Keepalive** for persistent profiles: scheduled visits keep sliding login sessions alive without a model, and a
   logged-out profile raises an MCPL `bosun:needs-human` push event. A visit can also **watch** one value (say, a
   "43 neue Nachrichten" counter) and push `bosun:watch-changed` when it goes up. See
@@ -51,7 +61,8 @@ npm run test:engines  # the same suite once per installed engine
 # stdio (an MCP client spawns it)
 xvfb-run -a node src/server.mjs
 
-# WebSocket service + live view, reachable over a VPN interface (here 100.64.0.10)
+# WebSocket service + live view, reachable over a VPN interface (here 100.64.0.10; for a systemd service with
+# both listeners on loopback behind a private-network proxy see docs/DEPLOY-SYSTEMD.md)
 WS_HOST=100.64.0.10 WS_PORT=7360 BROWSER_TOKEN=<32+ random chars> \
 LIVE_HOST=100.64.0.10 LIVE_PORT=7350 LIVE_BASE_URL=http://100.64.0.10:7350 \
   xvfb-run -a -s "-screen 0 1366x900x24" node src/server.mjs
@@ -72,6 +83,12 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `BROWSER_TOKENS` | – | more tenants: `alice:<token>,bob:<token>` |
 | `BROWSER_TOKEN_POLICIES` | – (all `full`) | per-tenant policy: `swarm=ephemeral` (see [Read-only tokens for subagents](#read-only-tokens-for-subagents)) |
 | `BROWSER_EPHEMERAL_MAX_SESSIONS` | 2 | session cap of each `ephemeral` tenant (at most `MAX_SESSIONS_PER_TENANT`) |
+| `BROWSER_TENANT_ALLOW` | – (unrestricted) | per-tenant host allowlist, enforced by a per-tenant forward proxy: `ops=*.example.org,127.0.0.1:4848; swarm=*.example.org` (see [Per-tenant host allowlist](#per-tenant-host-allowlist)) |
+| `FEATURES_MEETINGS` | `0` | `1` = list and wire the meeting tools (this fork: off) |
+| `FEATURES_ENGINES` | `chromium` | engines a session may ask for, comma list; `ENGINE` is always included |
+| `CHROMIUM_SANDBOX` | `1` | `0` = run Chromium without its own sandbox (logged at every start); see [Chromium sandbox](#chromium-sandbox) |
+| `DOWNLOADS` | `0` | `1` = let pages download files (with the budget below); `0` = the context refuses them |
+| `DOWNLOADS_MAX_MB` / `DOWNLOADS_TOTAL_MAX_MB` | 100 / 500 | downloaded bytes a session, and the whole service, may keep |
 | `WS_HOST` / `WS_PORT` | `127.0.0.1` / – | WebSocket MCP listener (stdio when `WS_PORT` is unset) |
 | `WS_ALLOWED_ORIGINS` | – | comma list of browser Origins allowed to connect (non-browser clients send none) |
 | `ALLOW_NO_TOKEN` | – | `1` = no auth, loopback only |
@@ -104,7 +121,9 @@ All numbers are validated at startup; a bad value stops the service instead of s
 | `patchright` | a browser per session (persistent context; temp profile for ephemeral sessions) | CDP screencast | patchright's recommended setup: no custom UA, no automation-flag args, window-sized viewport |
 | `camoufox` | a browser per session | Playwright screencast + `page.mouse`/`keyboard` | fingerprint (window, screen, fonts, UA) from Camoufox; `humanize` off (hangs clicks with Playwright 1.64) |
 
-A session asking for an engine that isn't installed gets an error naming the install command; there is no silent
+Only the engines in `FEATURES_ENGINES` (default `chromium`, plus whatever `ENGINE` is set to) can be asked for;
+`session_open`'s schema lists exactly those, and the session manager refuses the others. A session asking for an
+engine that is enabled but isn't installed gets an error naming the install command; there is no silent
 fallback to another engine. A persistent profile remembers its engine family (Chromium or Firefox) and refuses the
 other. patchright and camoufox-js are `optionalDependencies`; their browsers are separate downloads.
 
@@ -142,8 +161,10 @@ Chromium spawns many threads: under systemd give the unit a generous `TasksMax` 
   output. The handoff ends only after the human's last input has reached the page.
 - A password field that is revealed with a show-password toggle stays masked: an event-driven tracker remembers every
   input that ever was `type=password` (incl. shadow roots), and Bosun also notes them when a handoff starts and every
-  500 ms during it. On `chromium` Bosun's helpers run in the page's own JavaScript world, so a page can detect them;
-  on `patchright` and `camoufox` they run in an isolated world (details in [docs/ENGINES.md](docs/ENGINES.md)).
+  500 ms during it. On `chromium` Bosun's helpers run in the page's own JavaScript world, so a page can detect them
+  — and replace them, which switches masking off for fields that aren't sensitive by markup (probed, see
+  [docs/FORK-SECURITY-REVIEW.md](docs/FORK-SECURITY-REVIEW.md) finding H2); on `patchright` and `camoufox` they run
+  in an isolated world, which stops that and nothing else (details in [docs/ENGINES.md](docs/ENGINES.md)).
 - Not protected: text the human types into ordinary fields, secrets the page itself echoes as normal text, custom
   widgets that aren't `<input>`/`<textarea>` (e.g. per-digit OTP boxes built from `div`s), closed shadow roots.
   Those are visible to the agent after Done. Ask the human to finish the login (submit it) before pressing Done.
@@ -252,6 +273,9 @@ Between visits nothing is watched, so with `every_minutes: 30` a new message is 
 arrived on average and up to about 40 minutes after (longer in quiet hours). Several changes between two visits make one event, carrying the latest value.
 
 ## Meetings (PoC)
+
+> Off by default in this fork: set `FEATURES_MEETINGS=1` to list the tools and wire their handlers. With `0` nothing
+> of the below runs — no recordings directory, no audio server. Read the consent notes before turning it on.
 
 Bosun can attend a **Google Meet** as a notetaker: it joins as an **unauthenticated guest**, or with a Bosun
 profile that is **signed in to a Google account**, records the meeting's audio and leaves. Nothing is transcribed live: the agent gets the recording when the meeting ends and transcribes it
@@ -405,6 +429,92 @@ on stderr. The opening handshake times out after 15 s. Exit codes: `0` stdin end
 `2` bad configuration (missing variable, a non-ws URL, credentials in the URL), `3` token refused. The bridge needs
 only Node and the `ws` package.
 
+## Chromium sandbox
+
+The browser parses untrusted web content, so it runs with **Chromium's own sandbox** (`chromiumSandbox: true`,
+which is what `CHROMIUM_SANDBOX=1`, the default, means). Playwright's default is `--no-sandbox`; this fork does not
+use it.
+
+The sandbox needs something from the host, and startup checks it: Bosun starts the browser once, closes it again,
+and **refuses to run** if that fails, printing what to do. On Linux, one of these has to be true:
+
+1. unprivileged user namespaces are allowed —
+   `echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/60-apparmor-userns.conf && sudo sysctl --system`
+   (Ubuntu 23.10+ restricts them through AppArmor), or
+2. an AppArmor profile grants `userns` to the browser binary, or
+3. Chromium's setuid helper next to the browser is root-owned and mode 4755, with `CHROME_DEVEL_SANDBOX` pointing at
+   it — and then the service must **not** run with `NoNewPrivileges`.
+
+[docs/DEPLOY-SYSTEMD.md](docs/DEPLOY-SYSTEMD.md) has the commands for each. A container or CI box usually allows
+none of them; there, `CHROMIUM_SANDBOX=0` is the explicit way out, and the service says so on every start:
+
+```
+bosun: WARNING — CHROMIUM_SANDBOX=0: the browser runs without its own sandbox, …
+```
+
+Check what is actually running, not just the setting: `ps -eo args | grep -- --type=renderer` must show no
+`--no-sandbox`.
+
+## Per-tenant host allowlist
+
+Keep a tenant to the hosts it has business with — so a page that says "now open this other URL" gets nowhere, and
+neither does a redirect, an iframe, a `fetch`, a WebSocket or anything a worker starts:
+
+```sh
+BROWSER_TENANT_ALLOW='ops=*.example.org,example.org,127.0.0.1:4848; swarm=*.example.org'
+```
+
+Entries are separated by `;` (or newlines), hosts within an entry by `,`. A host pattern is:
+
+| pattern | matches |
+|---|---|
+| `example.org` | exactly that host, on any port |
+| `*.example.org` | any subdomain, on any port — **not** the apex (list it separately) |
+| `example.org:8443`, `127.0.0.1:4848`, `[::1]:4848` | that host on that port only |
+| `*` | every host (the escape hatch) |
+
+### How it is enforced
+
+A tenant that is named gets **its own forward proxy inside the service** (`src/proxy.mjs`, on loopback, with a
+random password of its own) **and a browser of its own**, launched with that proxy as its only way out
+(`--proxy-bypass-list=<-loopback>`, so not even loopback is exempt; QUIC off and WebRTC's non-proxied UDP off, so
+nothing can go around it; Chromium does not fall back to a direct connection when a proxy refuses). Those flags
+belong to that browser alone — tenants without an allowlist share a browser launched exactly the way upstream
+launches it, so one tenant's allowlist never changes another tenant's networking. Every
+connection the browser wants — a navigation, each hop of a redirect, a subresource, XHR, a WebSocket from the page
+**or from a worker**, a service-worker fetch, a prefetch — arrives at the proxy as a request or a `CONNECT` and is
+checked against the allowlist before a byte leaves the host:
+
+- A denied connection is never made. The browser gets `403` from the proxy, so a denied navigation leaves the tab
+  on that URL with the proxy's one-line reason and `navigate` reports `status: 403` and `refused: "host allowlist"`.
+- Denials are logged as `bosun: tenant <t>: blocked <host>:<port> — <reason>`: host and port, never a path or a
+  query. One line per target per tenant (a repeat is counted, not logged again).
+- **DNS is resolved by the proxy, once**, and the connection goes to that address, so the address a decision was
+  made about is the address that gets used — a name cannot change where it points between the check and the
+  connection. A name that resolves into loopback or a private range is only followed if the allowlist names that
+  address as well, so `127.0.0.1:4848` has to be in the list for a name that resolves there.
+- **Nothing is intercepted.** The proxy tunnels TLS (`CONNECT`) and streams plain HTTP; it never terminates TLS,
+  rewrites a response or buffers a body. The browser's own rules therefore all still hold: a redirect to another
+  allowed host loads **as that host**, with its own origin, storage and cookies, and the tab shows the URL it
+  really ended up on.
+- `navigate` and `keepalive_set` also check the allowlist up front, so the agent gets a clear refusal instead of a
+  403 page, and `navigate`'s tool description names the hosts it may reach.
+
+A tenant that is not named is unrestricted: no proxy, nothing intercepted, and a browser with upstream's own flags
+— exactly upstream behaviour, whatever another tenant's allowlist says.
+
+### What it does not do
+
+- The allowlist is host and port, and a `CONNECT` tunnel is not inspected, so an entry without a port allows a
+  tunnel to **any** port on that host. Prefer `host:port` entries.
+- It is not a URL filter: a path or a query is never looked at (and never logged).
+- Hosts you allow can talk to each other with the browser's normal rules; the allowlist decides reachability, not
+  mutual trust. Keep it to the hosts a tenant needs.
+- Plain `http://` goes through the proxy as HTTP/1.1 (no h2c, no QUIC); `https://` is end-to-end inside the tunnel.
+- A firewall is still the outer boundary: the proxy is a per-tenant rule inside the service, not a replacement for
+  network egress policy (see [Security notes](#security-notes) and
+  [docs/FORK-SECURITY-REVIEW.md](docs/FORK-SECURITY-REVIEW.md)).
+
 ## Security notes
 
 - One service is one trust domain per **tenant** (token): a tenant's connections share its persistent profiles;
@@ -418,6 +528,20 @@ only Node and the `ws` package.
   finished — that revokes the link for good (no replay afterwards). A connected, responsive viewer can't be pushed
   out by a second one.
 - No rate limiting yet beyond the connection, in-flight and session caps.
+- A named tenant can be kept to a list of hosts, enforced by a per-tenant forward proxy that is the browser's only
+  way out (see [Per-tenant host allowlist](#per-tenant-host-allowlist)). That narrows what the agent, the page, its
+  workers and its service workers can reach; it does not replace the egress boundary above.
+- The browser runs with its own sandbox (see [Chromium sandbox](#chromium-sandbox)). Upstream's default, and this
+  fork's with `CHROMIUM_SANDBOX=0`, is `--no-sandbox`: then a renderer compromise is directly on the service user,
+  which is where the profiles and the service's environment (tokens included) are.
+- Downloads are off by default (`DOWNLOADS=0`), and bounded by a disk budget when enabled, so a page cannot fill
+  the volume.
+- Credential masking around a handoff covers credential **fields** — their value, and values Bosun saw in them. A
+  page that copies what the human typed into ordinary text, or into something it reads later, is not masked on
+  **any** engine, and on `chromium` a page can also neutralize the masking helpers outright (they run in its own
+  JavaScript world; `patchright` uses an isolated one, which stops that technique and nothing more). Treat the page
+  where a credential is typed as trusted, or don't type it there. Details, probes and the standing test:
+  [docs/FORK-SECURITY-REVIEW.md](docs/FORK-SECURITY-REVIEW.md) (finding H2).
 
 ## Roadmap
 

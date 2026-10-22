@@ -1,5 +1,6 @@
 // Environment -> validated configuration. Anything malformed or unsafe throws, so the service refuses to start.
 import { isLoopbackHost, parsePolicies, parseTokens } from './auth.mjs';
+import { parseTenantAllow } from './allow.mjs';
 import { ENGINE_NAMES } from './engines.mjs';
 
 function int(env, name, def, min, max) {
@@ -12,6 +13,14 @@ function int(env, name, def, min, max) {
 }
 
 const list = (s) => String(s || '').split(',').map((x) => x.trim()).filter(Boolean);
+
+// A 0/1 switch. Anything else stops the service rather than silently turning a feature on or off.
+function flag(env, name, def) {
+  const raw = env[name];
+  if (raw === undefined || raw === '') return def;
+  if (raw !== '0' && raw !== '1') throw new Error(`${name} must be 0 or 1 (got "${raw}")`);
+  return raw === '1';
+}
 
 export function loadConfig(env = process.env) {
   const cfg = {
@@ -32,6 +41,15 @@ export function loadConfig(env = process.env) {
     recordingRetentionDays: int(env, 'RECORDING_RETENTION_DAYS', 30, 1, 3650), // meeting recordings are deleted after this
     meetingOwner: (env.MEETING_OWNER || '').trim().slice(0, 60) || null, // named in the meeting announcement ("X's AI notetaker")
     tokens: parseTokens(env),
+    // Fork: features that are off unless this deployment asks for them.
+    features: { meetings: flag(env, 'FEATURES_MEETINGS', false) },
+    // Chromium's own sandbox. On by default: a renderer that runs untrusted web content must not sit directly on the
+    // service user. 0 is an explicit, logged choice (see README > Chromium sandbox).
+    chromiumSandbox: flag(env, 'CHROMIUM_SANDBOX', true),
+    // Downloads a page starts. Off by default: nothing a page fetches is written to disk.
+    downloads: flag(env, 'DOWNLOADS', false),
+    engines: null, // engines a session may choose
+    tenantAllow: null, // tenant -> host patterns (fork: per-tenant navigation allowlist)
     policies: null,
     ws: null,
     live: null,
@@ -39,6 +57,14 @@ export function loadConfig(env = process.env) {
   if (!ENGINE_NAMES.includes(cfg.engine)) throw new Error(`ENGINE must be one of ${ENGINE_NAMES.join(', ')} (got "${cfg.engine}")`);
   try { new Intl.DateTimeFormat('en', { timeZone: cfg.tz }); } catch { throw new Error(`TZ must be an IANA time zone such as Europe/Vienna (got "${cfg.tz}")`); }
   if (cfg.camoufoxOs && !['macos', 'windows', 'linux'].includes(cfg.camoufoxOs)) throw new Error('CAMOUFOX_OS must be macos, windows or linux');
+  // Engines a session may ask for: FEATURES_ENGINES (default: chromium only), plus the configured default engine.
+  const wanted = list(env.FEATURES_ENGINES || 'chromium');
+  for (const e of wanted) if (!ENGINE_NAMES.includes(e)) throw new Error(`FEATURES_ENGINES must be a comma list of ${ENGINE_NAMES.join(', ')} (got "${e}")`);
+  cfg.engines = ENGINE_NAMES.filter((e) => e === cfg.engine || wanted.includes(e));
+  cfg.tenantAllow = parseTenantAllow(env, cfg.tokens);
+  // Disk budget for downloads (only when DOWNLOADS=1): per session, and across all sessions.
+  cfg.downloadMaxMb = int(env, 'DOWNLOADS_MAX_MB', 100, 1, 1_000_000);
+  cfg.downloadTotalMaxMb = int(env, 'DOWNLOADS_TOTAL_MAX_MB', Math.max(500, cfg.downloadMaxMb), cfg.downloadMaxMb, 10_000_000);
   cfg.maxSessionsPerTenant = int(env, 'MAX_SESSIONS_PER_TENANT', cfg.maxSessions, 1, cfg.maxSessions);
   cfg.policies = parsePolicies(env, cfg.tokens);
   // Session cap of each tenant with policy "ephemeral".

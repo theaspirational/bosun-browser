@@ -266,7 +266,7 @@ export class Keepalive {
   // Schedule: everyMinutes (>= MIN_PERIOD_MIN) or everyHours (default 12); jitterMin defaults to 30 or a quarter of
   // the interval, whichever is less. watch: {selector?, textRegex?, kind, label}.
   set(tenant, { profile, url, everyHours, everyMinutes, jitterMin, quietHours = null, check, watch = null, enabled = true }) {
-    url = httpUrl(url);
+    url = this.manager.checkAllowed(tenant, httpUrl(url));
     if (!fs.existsSync(this.profileDir(tenant, profile))) throw new Error(`no profile ${profile}: open it once with session_open({profile}) and log in first`);
     if (everyHours != null && everyMinutes != null) throw new Error('give every_hours or every_minutes, not both');
     if (everyMinutes != null && !(Number.isInteger(everyMinutes) && everyMinutes >= MIN_PERIOD_MIN)) throw new Error(`every_minutes must be a whole number of at least ${MIN_PERIOD_MIN}`);
@@ -401,6 +401,8 @@ export class Keepalive {
     let status = 'error', reason = null, s = null, phase = 'open', watched = null;
     try {
       try { httpUrl(url); } catch { reason = 'url is not http(s)'; throw new Error(reason); }
+      // The tenant's allowlist may have changed since the schedule was set.
+      try { this.manager.checkAllowed(e.tenant, url); } catch { reason = 'url is not in the host allowlist'; throw new Error(reason); }
       const meta = readProfileMeta(this.profileDir(e.tenant, e.profile));
       // Same mode as normal use, so the fingerprint stays consistent: never open a headful profile headless.
       if (this.cfg.headless && meta?.headless !== true) { reason = 'profile is used headful; keepalive will not open it headless (run the service headful)'; throw new Error(reason); }
