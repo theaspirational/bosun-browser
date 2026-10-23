@@ -43,7 +43,10 @@ export function loadConfig(env = process.env) {
     tokens: parseTokens(env),
     // Features a deployment can switch off. FEATURES_MEETINGS=0: no meeting tools, handlers or recordings directory.
     // FEATURES_UPLOADS=0: no upload tools and no PUT endpoint.
-    features: { meetings: flag(env, 'FEATURES_MEETINGS', true), uploads: flag(env, 'FEATURES_UPLOADS', true) },
+    // Fork: meetings are OFF unless this deployment asks for them (upstream has them on). They add a recording
+    // consent surface and an audio server this deployment does not use; a default that fails safe also covers an
+    // EnvironmentFile that lost the line. See docs/FORK-SECURITY-REVIEW.md.
+    features: { meetings: flag(env, 'FEATURES_MEETINGS', false), uploads: flag(env, 'FEATURES_UPLOADS', true) },
     // Chromium's own sandbox. On by default: a renderer that runs untrusted web content must not sit directly on the
     // service user. 0 is an explicit, logged choice (see README > Chromium sandbox).
     chromiumSandbox: flag(env, 'CHROMIUM_SANDBOX', true),
@@ -58,8 +61,10 @@ export function loadConfig(env = process.env) {
   if (!ENGINE_NAMES.includes(cfg.engine)) throw new Error(`ENGINE must be one of ${ENGINE_NAMES.join(', ')} (got "${cfg.engine}")`);
   try { new Intl.DateTimeFormat('en', { timeZone: cfg.tz }); } catch { throw new Error(`TZ must be an IANA time zone such as Europe/Vienna (got "${cfg.tz}")`); }
   if (cfg.camoufoxOs && !['macos', 'windows', 'linux'].includes(cfg.camoufoxOs)) throw new Error('CAMOUFOX_OS must be macos, windows or linux');
-  // Engines a session may ask for: FEATURES_ENGINES (default: all of them), plus the configured default engine.
-  const wanted = env.FEATURES_ENGINES ? list(env.FEATURES_ENGINES) : ENGINE_NAMES;
+  // Engines a session may ask for: FEATURES_ENGINES, plus the configured default engine.
+  // Fork: the default is chromium alone (upstream's is all three). The anti-detect engines are not installed in
+  // this deployment, and engine choice is a weaker credential boundary than it looks (review finding H2).
+  const wanted = list(env.FEATURES_ENGINES || 'chromium');
   for (const e of wanted) if (!ENGINE_NAMES.includes(e)) throw new Error(`FEATURES_ENGINES must be a comma list of ${ENGINE_NAMES.join(', ')} (got "${e}")`);
   cfg.engines = ENGINE_NAMES.filter((e) => e === cfg.engine || wanted.includes(e));
   cfg.tenantAllow = parseTenantAllow(env, cfg.tokens);

@@ -10,7 +10,8 @@ them.
 
 Threat model behind these choices: the browser runs untrusted web content, so it keeps **Chromium's own sandbox**
 (§3a — this needs host configuration, and the service refuses to start without it), and the user it runs as must
-own nothing else and reach nothing else. See [SECURITY-REVIEW-0.7.0.md](SECURITY-REVIEW-0.7.0.md) — in particular H1
+own nothing else and reach nothing else. See [SECURITY-REVIEW-0.7.0.md](SECURITY-REVIEW-0.7.0.md) (and this fork's
+[FORK-SECURITY-REVIEW.md](FORK-SECURITY-REVIEW.md) for uploads and meeting joins) — in particular H1
 (where the browser may go), H3 (the sandbox), M1 (the live-view link is a bearer token), M4 (child processes inherit
 the service's environment, tokens included) and M5 (downloads on disk).
 
@@ -177,7 +178,7 @@ host), without a trailing path.
 
 ```sh
 BROWSER_TENANT_ALLOW=ops=*.example.org,example.org,127.0.0.1:4848; swarm=*.example.org
-# Only if you don't use them (both default to on):
+# Both are already this fork's defaults; set them anyway, so the unit does not depend on a default:
 FEATURES_MEETINGS=0
 FEATURES_ENGINES=chromium
 ```
@@ -202,11 +203,12 @@ FEATURES_ENGINES=chromium
   CAPTCHA vendor. A handoff can only reach what the tenant may reach.
 - A tenant that is not named is unrestricted and gets no proxy at all.
 - This is a per-tenant rule inside the service, not a replacement for the egress policy in §4.
-- `FEATURES_MEETINGS=0` (the default is `1`) means the meeting tools are not listed and their handlers are not wired:
+- `FEATURES_MEETINGS=0` (this fork's default; upstream's is `1`) means the meeting tools are not listed and their handlers are not wired:
   no recordings directory, no PulseAudio server, no `ffmpeg`. Turning it on adds a recording consent surface — read
   README › Meetings first.
-- `FEATURES_ENGINES=chromium` (the default is all three) means a session cannot ask for the anti-detect engines.
-  Set it whenever `npm ci --omit=optional` left them out, or list exactly the ones you installed. `patchright` runs Bosun's
+- `FEATURES_ENGINES=chromium` (this fork's default; upstream's is all three) means a session cannot ask for the
+  anti-detect engines. Keep it that way whenever `npm ci --omit=optional` left them out, or list exactly the ones
+  you installed. `patchright` runs Bosun's
   masking helpers in an isolated world, which stops a page from switching masking off — but not from copying what
   the human typed somewhere masking does not look (review finding H2). No engine makes an untrusted page safe to
   type a credential into.
@@ -243,6 +245,9 @@ FEATURES_ENGINES=chromium
 - [ ] `ss -ltnp` shows both Bosun ports bound to `127.0.0.1` only.
 - [ ] `tailscale serve status` shows the live view, and `tailscale funnel status` shows nothing.
 - [ ] `LIVE_BASE_URL` matches the `tailscale serve` address; a link opens on a phone in the tailnet.
+- [ ] `UPLOAD_BASE_URL` matches how agents really reach the MCP port whenever that is not the `Host` they
+      connect with (TLS in front, a path): `upload_create`'s `put_url` is otherwise built as `http://<Host>`,
+      and it carries a one-time secret in its query string.
 - [ ] Every tenant that should be restricted appears in `BROWSER_TENANT_ALLOW`; a `navigate` to another host is
       refused, and the refusal shows up in the journal without the query.
 - [ ] `FEATURES_MEETINGS` matches whether meetings are used, `FEATURES_ENGINES` lists only what is installed,

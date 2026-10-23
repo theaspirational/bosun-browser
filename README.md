@@ -22,7 +22,7 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 - Tools: `session_open` / `session_close` / `sessions`, `navigate`, `read` (accessibility snapshot with element
   refs), `click`, `type`, `select`, `press`, `back`, `wait_for`, `screenshot`, `request_human`, `handoff_wait`,
   `keepalive_set` / `keepalive_list` / `keepalive_remove`, `upload_create` / `upload` (unless `FEATURES_UPLOADS=0`),
-  and (unless `FEATURES_MEETINGS=0`) `meeting_join` /
+  and (only with `FEATURES_MEETINGS=1`, which this fork does not default to) `meeting_join` /
   `meeting_status` / `meeting_chat_read` / `meeting_chat_send` / `meeting_stop_recording` /
   `meeting_leave` / `meeting_recording_delete`.
 - **Keepalive** for persistent profiles: scheduled visits keep sliding login sessions alive without a model, and a
@@ -85,13 +85,13 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `BROWSER_TOKEN_POLICIES` | – (all `full`) | per-tenant policy: `swarm=ephemeral` (see [Read-only tokens for subagents](#read-only-tokens-for-subagents)) |
 | `BROWSER_EPHEMERAL_MAX_SESSIONS` | 2 | session cap of each `ephemeral` tenant (at most `MAX_SESSIONS_PER_TENANT`) |
 | `BROWSER_TENANT_ALLOW` | – (unrestricted) | per-tenant host allowlist, enforced by a per-tenant forward proxy: `ops=*.example.org,127.0.0.1:4848; swarm=*.example.org` (see [Per-tenant host allowlist](#per-tenant-host-allowlist)) |
-| `FEATURES_MEETINGS` | `1` | `0` = the meeting tools are not listed and their handlers not wired |
+| `FEATURES_MEETINGS` | `0` in this fork (upstream: `1`) | `1` = wire the meeting tools; `0` = they are not listed and their handlers not wired |
 | `FEATURES_UPLOADS` | `1` | `0` = no upload tools and no PUT endpoint |
 | `UPLOAD_MAX_BYTES` | 314572800 (300 MB) | largest file one upload may carry |
 | `UPLOAD_TENANT_QUOTA_BYTES` | 1073741824 (1 GB) | uploaded bytes one tenant may hold at a time (at least `UPLOAD_MAX_BYTES`) |
 | `UPLOAD_TTL_SEC` / `UPLOAD_URL_TTL_SEC` | 3600 / 900 | an uploaded file is deleted this long after it arrived; an upload URL is valid this long |
 | `UPLOAD_BASE_URL` | – (the `Host` the client connected with, `http://`) | where tenants reach the MCP port, for the PUT URL; set it behind TLS or another name |
-| `FEATURES_ENGINES` | all three | engines a session may ask for, comma list (e.g. `chromium`); `ENGINE` is always included |
+| `FEATURES_ENGINES` | `chromium` in this fork (upstream: all three) | engines a session may ask for, comma list (e.g. `chromium,patchright`); `ENGINE` is always included |
 | `CHROMIUM_SANDBOX` | `1` | `0` = run Chromium without its own sandbox (logged at every start); see [Chromium sandbox](#chromium-sandbox) |
 | `DOWNLOADS` | `0` | `1` = let pages download files (with the budget below); `0` = the context refuses them |
 | `DOWNLOADS_MAX_MB` / `DOWNLOADS_TOTAL_MAX_MB` | 100 / 500 | downloaded bytes a session, and the whole service, may keep |
@@ -127,7 +127,8 @@ All numbers are validated at startup; a bad value stops the service instead of s
 | `patchright` | a browser per session (persistent context; temp profile for ephemeral sessions) | CDP screencast | patchright's recommended setup: no custom UA, no automation-flag args, window-sized viewport |
 | `camoufox` | a browser per session | Playwright screencast + `page.mouse`/`keyboard` | fingerprint (window, screen, fonts, UA) from Camoufox; `humanize` off (hangs clicks with Playwright 1.64) |
 
-Only the engines in `FEATURES_ENGINES` (default: all three; `ENGINE` is always included) can be asked for;
+Only the engines in `FEATURES_ENGINES` (default in this fork: `chromium`; upstream: all three; `ENGINE` is always
+included) can be asked for;
 `session_open`'s schema lists exactly those, and the session manager refuses the others. A session asking for an
 engine that is enabled but isn't installed gets an error naming the install command; there is no silent
 fallback to another engine. A persistent profile remembers its engine family (Chromium or Firefox) and refuses the
@@ -335,7 +336,8 @@ arrived on average and up to about 40 minutes after (longer in quiet hours). Sev
 ## Meetings (PoC)
 
 > `FEATURES_MEETINGS=0` switches meetings off: the tools are not listed and their handlers are not wired, and nothing
-> of the below runs — no recordings directory, no audio server. Read the consent notes before using them.
+> of the below runs — no recordings directory, no audio server. **That is the default in this fork** (upstream
+> defaults to on), so everything below needs `FEATURES_MEETINGS=1`. Read the consent notes before using them.
 
 Bosun can attend a **Google Meet** or a **Zoom** meeting as a notetaker, record its audio and leave.
 - **Meet:** as an **unauthenticated guest**, or with a Bosun profile **signed in to a Google account**.

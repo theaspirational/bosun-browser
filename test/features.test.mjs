@@ -1,6 +1,7 @@
-// Feature switches (on by default) and Chromium's own sandbox. Meetings (FEATURES_MEETINGS=0): the tools are not
-// listed and their handlers are never wired, and no meeting machinery starts. Engines (FEATURES_ENGINES=chromium): a
-// session can only pick chromium, unless the deployment enables more or sets ENGINE to another one.
+// Feature switches and Chromium's own sandbox. Meetings (FEATURES_MEETINGS=0, this fork's default): the tools are
+// not listed and their handlers are never wired, and no meeting machinery starts. Engines (FEATURES_ENGINES=chromium,
+// this fork's default): a session can only pick chromium, unless the deployment enables more or sets ENGINE to
+// another one. Uploads are on by default, as upstream has them.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'fs';
@@ -14,18 +15,28 @@ const SERVER = new URL('../src/server.mjs', import.meta.url).pathname;
 
 const MEETING_TOOLS = ['meeting_join', 'meeting_status', 'meeting_chat_read', 'meeting_chat_send', 'meeting_stop_recording', 'meeting_leave', 'meeting_recording_delete'];
 
-test('FEATURES_MEETINGS defaults to on and is a 0/1 switch', () => {
-  assert.equal(loadConfig({}).features.meetings, true);
+// Fork: meetings are off unless the deployment asks for them (upstream's default is on).
+test('FEATURES_MEETINGS defaults to off in this fork and is a 0/1 switch', () => {
+  assert.equal(loadConfig({}).features.meetings, false);
   assert.equal(loadConfig({ FEATURES_MEETINGS: '0' }).features.meetings, false);
-  assert.equal(loadConfig({ FEATURES_MEETINGS: '' }).features.meetings, true);
+  assert.equal(loadConfig({ FEATURES_MEETINGS: '' }).features.meetings, false);
   assert.equal(loadConfig({ FEATURES_MEETINGS: '1' }).features.meetings, true);
   assert.throws(() => loadConfig({ FEATURES_MEETINGS: 'yes' }), /FEATURES_MEETINGS must be 0 or 1/);
 });
 
-test('FEATURES_ENGINES defaults to every engine and always includes ENGINE', () => {
-  assert.deepEqual(loadConfig({}).engines, ['chromium', 'patchright', 'camoufox']);
-  assert.deepEqual(loadConfig({ FEATURES_ENGINES: '' }).engines, ['chromium', 'patchright', 'camoufox']);
+// Uploads stay as upstream has them: on, bounded by the per-file cap and the per-tenant quota.
+test('FEATURES_UPLOADS defaults to on and is a 0/1 switch', () => {
+  assert.equal(loadConfig({}).features.uploads, true);
+  assert.equal(loadConfig({ FEATURES_UPLOADS: '0' }).features.uploads, false);
+  assert.throws(() => loadConfig({ FEATURES_UPLOADS: 'yes' }), /FEATURES_UPLOADS must be 0 or 1/);
+});
+
+// Fork: chromium alone unless the deployment asks for more (upstream's default is all three).
+test('FEATURES_ENGINES defaults to chromium in this fork and always includes ENGINE', () => {
+  assert.deepEqual(loadConfig({}).engines, ['chromium']);
+  assert.deepEqual(loadConfig({ FEATURES_ENGINES: '' }).engines, ['chromium']);
   assert.deepEqual(loadConfig({ FEATURES_ENGINES: 'chromium' }).engines, ['chromium']);
+  assert.deepEqual(loadConfig({ FEATURES_ENGINES: 'chromium,patchright,camoufox' }).engines, ['chromium', 'patchright', 'camoufox']);
   assert.deepEqual(loadConfig({ FEATURES_ENGINES: 'camoufox,patchright' }).engines, ['chromium', 'patchright', 'camoufox']);
   // An explicitly configured default engine is enabled by that choice.
   assert.deepEqual(loadConfig({ ENGINE: 'patchright', FEATURES_ENGINES: 'chromium' }).engines, ['chromium', 'patchright']);
