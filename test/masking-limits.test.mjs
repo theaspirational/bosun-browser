@@ -1,10 +1,10 @@
-// Fork: what credential masking does NOT cover, pinned down so the documentation cannot drift from the behaviour.
+// What credential masking does NOT cover, pinned down so the documentation cannot drift from the behaviour.
 // Masking works on the fields themselves — their current values, and the values Bosun saw in them. A page that moves
 // what the human typed somewhere else (into ordinary text, a hidden field it reads later, its own storage) is not
 // caught by it, on any engine: the scans share the page's DOM even where they run in an isolated world.
 //
 // These tests assert the limits as they are. If one of them starts failing because upstream masks more, that is good
-// news — update README > Handoff and docs/FORK-SECURITY-REVIEW.md (finding H2) with it.
+// news — update README > Handoff and docs/SECURITY-REVIEW-0.7.0.md (finding H2) with it.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'http';

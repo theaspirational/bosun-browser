@@ -8,12 +8,57 @@ import crypto from 'crypto';
 
 export const ENGINE_NAMES = ['chromium', 'patchright', 'camoufox'];
 export const CHROMIUM_ARGS = ['--disable-blink-features=AutomationControlled'];
-// Extra flags for a browser that serves a proxied tenant (fork): QUIC would not go through an HTTP proxy, and
+// Extra flags for a browser that serves a proxied tenant (host allowlist): QUIC would not go through an HTTP proxy, and
 // WebRTC must not open UDP of its own. Chromium does not fall back to a direct connection when a configured proxy
 // refuses or fails. They are Chromium flags, and they are added only where a proxy is in play: a browser serving
 // tenants without an allowlist is launched exactly the way upstream launches it.
 export const PROXY_ARGS = ['--disable-quic', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp'];
 const chromiumArgs = (proxy, extra = []) => [...CHROMIUM_ARGS, ...(proxy ? PROXY_ARGS : []), ...extra];
+// A persistent Chromium profile ignores --force-webrtc-ip-handling-policy (full Chromium reads the profile preference
+// instead; only the headless shell honours the flag), so a proxied tenant's profile directory also gets the
+// preference before launch. Bosun notes that it set it (MARKER, with the value it replaced), and an unproxied launch
+// restores exactly that, so an allowlist that is taken away later does not stay behind in the profile, and a
+// preference Bosun did not set is never touched.
+const WEBRTC_POLICY = 'disable_non_proxied_udp';
+const WEBRTC_MARKER = '.bosun-webrtc-policy';
+export function applyWebrtcPolicy(dir, proxied) {
+  const file = path.join(dir, 'Default', 'Preferences');
+  const marker = path.join(dir, WEBRTC_MARKER);
+  const owned = fs.existsSync(marker);
+  if (!proxied && !owned) return;
+  let prefs = {};
+  try { prefs = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  if (!prefs || typeof prefs !== 'object' || Array.isArray(prefs)) prefs = {};
+  const current = prefs.webrtc?.ip_handling_policy;
+  if (proxied) {
+    if (current === WEBRTC_POLICY) return; // already restricted (by us, or by whoever set it)
+    fs.writeFileSync(marker, JSON.stringify({ previous: current ?? null }), { mode: 0o600 });
+    prefs.webrtc = { ...prefs.webrtc, ip_handling_policy: WEBRTC_POLICY };
+  } else {
+    let previous = null;
+    try { ({ previous = null } = JSON.parse(fs.readFileSync(marker, 'utf8'))); } catch {}
+    if (current === WEBRTC_POLICY) {
+      if (previous === null) delete prefs.webrtc.ip_handling_policy;
+      else prefs.webrtc.ip_handling_policy = previous;
+    }
+    fs.rmSync(marker, { force: true });
+    if (current !== WEBRTC_POLICY) return;
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, JSON.stringify(prefs), { mode: 0o600 });
+}
+
+// The same for Firefox (camoufox), as preferences: Firefox never sends loopback through a proxy unless told to
+// (Chromium's "<-loopback>" bypass rule means nothing to it), WebRTC may only use the proxy, and HTTP/3 (QUIC) and
+// DNS prefetching stay off so nothing leaves the browser except through the proxy.
+export const PROXY_FIREFOX_PREFS = {
+  'network.proxy.allow_hijacking_localhost': true,
+  'network.proxy.no_proxies_on': '',
+  'media.peerconnection.ice.proxy_only': true,
+  'network.http.http3.enable': false,
+  'network.dns.disablePrefetch': true,
+  'network.predictor.enabled': false,
+};
 
 const INSTALL = {
   chromium: 'npx playwright install chromium',
@@ -69,7 +114,8 @@ const hostOs = () => ({ darwin: 'macos', win32: 'windows' })[process.platform] |
 
 // Each engine: { name, family, cdp, shared, tracker, load(), check(bt, cfg), open(bt, {cfg, dir, locale, timezone,
 // shared, media}) -> {ctx, browser?} }. media ({args, env}, meetings only, Chromium family): extra browser flags and the
-// environment of a browser process of its own (its audio server). shared: ephemeral sessions are contexts of a shared browser (manager.getBrowser: one per proxied tenant, one for the rest);
+// environment of a browser process of its own (its audio server). proxy: the tenant's forward proxy (host allowlist),
+// or null. shared: ephemeral sessions of tenants without a proxy are contexts of one shared browser (manager.getBrowser);
 // every other session is a persistent context in a directory Bosun owns (a profile or a temp dir), so its browser
 // processes can be found by that directory. tracker: how the password tracker gets into Bosun's evaluation world
 // ('init' script, or 'navigate': evaluate after every frame navigation). check: throws if the browser binary is absent.
@@ -81,10 +127,10 @@ function definitions(importer) {
       async load() { return (await importer('playwright')).chromium; },
       // Headless runs use Playwright's separate headless shell, whose path the API doesn't expose: checked at launch.
       async check(bt, cfg) { if (!cfg.headless) exists(bt.executablePath()); await sandboxPreflight(bt, cfg); },
-      // proxy: the tenant's forward proxy, or null. A browser launched with one serves only that tenant.
-      launchShared: (bt, cfg, proxy = null) => bt.launch({ headless: cfg.headless, args: chromiumArgs(proxy), chromiumSandbox: cfg.chromiumSandbox, ...(proxy ? { proxy } : {}) }),
+      launchShared: (bt, cfg) => bt.launch({ headless: cfg.headless, args: CHROMIUM_ARGS, chromiumSandbox: cfg.chromiumSandbox }),
       async open(bt, { cfg, dir, locale, timezone, shared, media, proxy }) {
         const o = { viewport: { width: 1366, height: 900 }, locale, timezoneId: timezone, acceptDownloads: cfg.downloads, ...(proxy ? { proxy } : {}) };
+        if (dir) applyWebrtcPolicy(dir, !!proxy);
         if (dir) return { ctx: await bt.launchPersistentContext(dir, { headless: cfg.headless, chromiumSandbox: cfg.chromiumSandbox, args: chromiumArgs(proxy, media?.args || []), ...(media?.env ? { env: media.env } : {}), ...o }) };
         const browser = await shared();
         return { ctx: await browser.newContext(o), browser };
@@ -97,6 +143,7 @@ function definitions(importer) {
       // Recommended patchright setup: persistent context, no custom UA/headers, no automation-flag args, the
       // browser's own window size (viewport: null).
       async open(bt, { cfg, dir, locale, timezone, media, proxy }) {
+        applyWebrtcPolicy(dir, !!proxy);
         const ctx = await bt.launchPersistentContext(dir, {
           channel: 'chromium', headless: cfg.headless, viewport: null, locale, timezoneId: timezone,
           args: ['--window-size=1366,900', ...(proxy ? PROXY_ARGS : []), ...(media?.args || [])],
@@ -116,11 +163,11 @@ function definitions(importer) {
       // Fingerprint (window, screen, fonts, UA) comes from Camoufox (viewport: null keeps Playwright out of it); the
       // OS matches the host unless CAMOUFOX_OS says otherwise, so fonts and rendering stay consistent with the claimed
       // platform. humanize stays off: with Playwright 1.64 its cursor patch makes actionability checks hang.
-      // A proxied tenant's Firefox gets the proxy, but not PROXY_ARGS: those are Chromium flags (camoufox is off
-      // by default in this fork, see README > Chromium sandbox / FEATURES_ENGINES).
+      // A proxied tenant's Firefox gets the proxy and PROXY_FIREFOX_PREFS (PROXY_ARGS are Chromium flags).
       async open({ launchOptions, firefox }, { cfg, dir, locale, timezone, proxy }) {
         const opts = await launchOptions({ headless: cfg.headless, os: cfg.camoufoxOs || hostOs(), locale, humanize: false });
-        return { ctx: await firefox.launchPersistentContext(dir, { ...opts, viewport: null, timezoneId: timezone, acceptDownloads: cfg.downloads, ...(proxy ? { proxy } : {}) }) };
+        const prefs = proxy ? { firefoxUserPrefs: { ...opts.firefoxUserPrefs, ...PROXY_FIREFOX_PREFS } } : {};
+        return { ctx: await firefox.launchPersistentContext(dir, { ...opts, ...prefs, viewport: null, timezoneId: timezone, acceptDownloads: cfg.downloads, ...(proxy ? { proxy } : {}) }) };
       },
     },
   };
@@ -150,13 +197,15 @@ export function createEngines({ importer = defaultImporter, overrides = {} } = {
       const bt = await load(name);
       try { await get(name).check?.(bt, cfg); } catch (e) { throw explain(name, e); }
     },
-    // Opens a context. Ephemeral sessions of non-shared engines get a private temp profile (tmpDir, removed on close).
+    // Opens a context. Ephemeral sessions of non-shared engines, of meetings and of proxied tenants get a private temp
+    // profile (tmpDir, removed on close): a proxied tenant's browser needs its own launch flags and profile
+    // preferences (applyWebrtcPolicy: full Chromium ignores the WebRTC flag), so it never shares a browser.
     async open(name, { cfg, profileDir, locale, timezone, shared, media, proxy = null }) {
       const def = get(name);
       if (media && def.family !== 'chromium') throw new EngineUnavailableError(`meetings need a Chromium engine (chromium or patchright), not ${name}`);
       const bt = await load(name);
       let dir = profileDir, tmpDir = null;
-      if (!dir && (!def.shared || media)) { // media: a browser process of its own
+      if (!dir && (!def.shared || media || proxy)) { // media, proxy: a browser process of its own
         tmpDir = dir = path.join(cfg.dataDir, 'tmp', `${name}-${crypto.randomBytes(6).toString('hex')}`);
         fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       }

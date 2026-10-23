@@ -241,7 +241,7 @@ test('bridge: LF-only framing, CRLF accepted, oversized records dropped without 
     assert.deepEqual((await b.reply(13)).result, {});
     assert.ok(!b.lines.some((l) => [10, 11].includes(JSON.parse(l).id)));
     assert.match(b.stderr(), /dropped a line that is not JSON/);
-    assert.match(b.stderr(), /dropped a message over 1 MiB/);
+    assert.match(b.stderr(), /dropped a message over 2 MiB/);
     b.p.stdin.end();
     assert.equal(await b.exited, 0);
   } finally { b.p.kill(); }

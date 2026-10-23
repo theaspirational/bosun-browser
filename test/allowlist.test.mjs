@@ -1,5 +1,5 @@
-// Fork: the per-tenant navigation host allowlist (BROWSER_TENANT_ALLOW). Pattern parsing and matching, enforcement
-// on navigate and on keepalive_set, and enforcement on the requests a page makes by itself (route interception),
+// The per-tenant host allowlist (BROWSER_TENANT_ALLOW). Pattern parsing and matching, enforcement on navigate and on
+// keepalive_set, and enforcement on the requests a page makes by itself (through the tenant's forward proxy),
 // including a navigation the page starts. A tenant without an allowlist is unrestricted.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -40,6 +40,13 @@ test('host patterns: host, *.host, host:port, bracketed IPv6, "*"', () => {
   for (const bad of ['', 'example.org:', 'example.org:abc', 'example.org:99999', '[::1', 'ex*mple.org', 'http://example.org', 'example.org/path']) {
     assert.throws(() => parseHostPattern(bad), /host pattern/, bad);
   }
+});
+
+test('address patterns match however the address is written', () => {
+  for (const [pattern, url] of [['[0:0:0:0:0:0:0:1]:4848', 'http://[::1]:4848/'], ['[::ffff:127.0.0.1]:4848', 'http://[::ffff:7f00:1]:4848/'], ['127.1:4848', 'http://127.0.0.1:4848/'], ['[::1]', 'ws://[0::1]/']]) {
+    assert.equal(allowsUrl([parseHostPattern(pattern)], url), true, `${pattern} vs ${url}`);
+  }
+  assert.throws(() => parseHostPattern('[::1::2]:80'), /not a valid host/);
 });
 
 test('allowsUrl: host and port, subdomains only under *., no scheme but http(s)', () => {

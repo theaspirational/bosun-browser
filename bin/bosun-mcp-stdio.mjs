@@ -5,7 +5,7 @@
 // configuration, 3 authentication refused.
 import WebSocket from 'ws';
 
-const MAX_LINE = 1024 * 1024; // bytes; Bosun's maxPayload: a longer message would get the connection closed
+const MAX_LINE = 2 * 1024 * 1024; // bytes; Bosun's maxPayload: a longer message would get the connection closed
 const HANDSHAKE_MS = 15_000;
 const MAX_PENDING = 8 * 1024 * 1024; // bytes read before the socket opens, or sent and not yet flushed
 
@@ -29,7 +29,7 @@ function lineReader(onLine) {
   let parts = [], size = 0, skipping = false;
   const record = (buf) => {
     if (skipping) { skipping = false; return; }
-    if (size + buf.length > MAX_LINE) { parts = []; size = 0; warn('dropped a message over 1 MiB'); return; }
+    if (size + buf.length > MAX_LINE) { parts = []; size = 0; warn('dropped a message over 2 MiB'); return; }
     let line = Buffer.concat([...parts, buf]);
     parts = []; size = 0;
     if (line.length && line[line.length - 1] === 0x0d) line = line.subarray(0, -1);
@@ -40,7 +40,7 @@ function lineReader(onLine) {
     while ((nl = chunk.indexOf(0x0a, start)) !== -1) { record(chunk.subarray(start, nl)); start = nl + 1; }
     const rest = chunk.subarray(start);
     if (!rest.length || skipping) return;
-    if (size + rest.length > MAX_LINE) { parts = []; size = 0; skipping = true; warn('dropped a message over 1 MiB'); return; }
+    if (size + rest.length > MAX_LINE) { parts = []; size = 0; skipping = true; warn('dropped a message over 2 MiB'); return; }
     parts.push(Buffer.from(rest)); size += rest.length;
   };
 }

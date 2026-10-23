@@ -271,7 +271,7 @@ test('history is bounded', async () => {
   });
 });
 
-test('a profile used headful is never visited headless; it is visited with its recorded engine', async () => {
+test('a profile used headful is never visited headless; it is visited with its recorded engine', { skip: process.env.TEST_HEADFUL === '1' && 'needs a headless service' }, async () => {
   await withService(async (svc) => {
     const c = await loggedInProfile(svc);
     await c.call('keepalive_set', { profile: 'shop', url: `${site.base}/app`, logged_in_check: { text: 'Signed in as' } });

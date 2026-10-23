@@ -1,5 +1,155 @@
 # Changelog
 
+## 0.10.0 — file uploads into web pages
+
+### Added
+
+- **`upload_create` and `upload`.** An agent can now put files into a page.
+  - `upload_create { filename, size_bytes? }` returns a `file_id` and a one-time PUT URL with a ready `curl -T`
+    line. The URL is valid for 15 min, works once, and only for the tenant that asked for it.
+  - The PUT goes to the MCP port itself, built from the `Host` the MCP client connected with (or
+    `UPLOAD_BASE_URL`), so whatever reaches MCP reaches it. The body streams straight to
+    `BROWSER_DATA/uploads/<tenant>/<file_id>/<filename>` (0600): not held in memory, not base64.
+  - `upload_create { filename, content_base64 }` stores a file of up to 1 MB at once, no PUT needed.
+  - `upload { session, ref | selector | role+name | text, file_id | files[] }` fills an `<input type=file>`
+    (hidden ones too, or through its label), or clicks a button and answers the file chooser it opens, or drops the
+    files on a drop zone (synthetic drag events, best effort). `method` forces one. Several files only where the
+    input or chooser allows `multiple`. The browser reads the files from disk itself.
+  - Limits: `UPLOAD_MAX_BYTES` (300 MB per file) and `UPLOAD_TENANT_QUOTA_BYTES` (1 GB per tenant), checked
+    against `Content-Length` and again while the body streams (`413`, nothing left on disk). `size_bytes`, when
+    given, must match exactly. A tenant holds at most 50 uploads at a time and streams 4 at once (16 in all;
+    `429`, retry the same URL). `Expect: 100-continue` is answered only after these
+    checks, so a refused file is never sent.
+  - Instead of the URL's secret, `PUT /upload/<file_id>` with the tenant's own token in `Authorization: Bearer`
+    works too (once, like the URL).
+  - Files are deleted when the session that used them closes, an hour after they arrived (`UPLOAD_TTL_SEC`), and
+    all of them when the service starts.
+  - Files never cross tenants: another tenant's `file_id` answers like one that never existed, and a PUT with
+    another tenant's token in `Authorization` is refused. Read-only tokens (policy `ephemeral`) can't upload.
+  - `FEATURES_UPLOADS=0` switches it all off: no tools, no PUT endpoint, no uploads directory.
+
+### Changed
+
+- The WebSocket message limit is 2 MiB (was 1 MiB), so a 1 MB file fits as base64; the stdio bridge follows.
+- The MCP port's HTTP server has no 5-minute request limit any more (a large upload takes longer). Each upload
+  PUT is bounded on its own: 60 s without data, an hour in all.
+
+### Limits
+
+- Drag-and-drop is synthetic (`isTrusted` false); drop zones that insist on real user events ignore it. Under
+  `camoufox` the drop runs as a script in the page, which a Content-Security-Policy without inline scripts refuses
+  (`note` says so).
+
+## 0.9.0 — signed-in meeting joins: Google Meet and Zoom
+
+### Added
+
+- **Zoom.** `meeting_join` takes Zoom links: `zoom.us/j/<id>?pwd=…`, any `*.zoom.us` subdomain, webinar `/w/` and
+  web client `/wc/` links. Bosun rewrites them to Zoom's web client (`https://app.zoom.us/wc/<id>/join?pwd=…`) and
+  joins with a profile signed in to Zoom (`profile`).
+  - The preview: the account's name is kept, microphone and camera verifiably off, cookie banners and tips
+    closed. If Zoom shows its app-launch page anyway, Bosun clicks "Join from your browser".
+  - Waiting room and "waiting for the host" count as `waiting`. Once admitted, Bosun joins computer audio (without
+    it nothing is heard or recorded), mutes the microphone Zoom may have turned on, and checks the camera is off.
+  - The rest is the Meet flow: the announcement in the chat before recording, the same audio recorder, every chat
+    message as `bosun:meeting-chat`, the opt-out phrases stop and delete the recording, participants from the
+    toolbar counter, and leaving when the meeting ends, Bosun is removed, or it is alone for 2 minutes.
+  - The announcement goes to everyone: the chat's recipient is switched to Everyone first. If the host allows chat
+    with the host only, Bosun leaves without recording. A message still in the chat box after Enter (an account
+    set to "Enter adds a new line") is sent with the Send button. The announcement has to show up in the chat, not
+    marked private; otherwise the meeting ends before recording.
+  - New join outcomes with their own reason and hint: `invalid-meeting` (wrong ID or passcode, or a link without
+    `?pwd=`), `sign-in-required`, `captcha`. Removal from the waiting room is `denied`. The link's `pwd` is an
+    encrypted token: Bosun never types it into a passcode field.
+  - `platform` is `zoom` in `meeting_status` and in the events (`bosun:platform`).
+- `meeting_status` shows `joined_as`: `account` (signed in) or `guest`.
+
+### Fixed
+
+- **Signed-in Google Meet joins.** The first live signed-in join (`profile: google-glassy`) failed with a
+  `locator.click` timeout on the join button. 0.8.0 already skipped the missing name field, but it clicked the
+  first join button once, with a 10 s timeout, after waiting 5 s for it to be enabled. Now:
+  - The lobby is detected as guest (a name field) or account (no name field, the account shown); `name` is used
+    for guests only.
+  - Dialogs and tips over the lobby ("Do you want people to hear you in the meeting?", "Got it", …) are closed
+    when they take the click. Only buttons inside a dialog are clicked, in EN/DE/SK/UK/RU.
+  - A disabled join button ("Getting ready...") is waited for up to 25 s, and the first *visible* join button is
+    clicked.
+  - With the account already in the call on another device, Bosun picks "Join here too" (also under "Other ways to
+    join") over "Switch here", which would drop the other device.
+  - Which of these caused the live failure isn't known: 0.8.0 fails on the dialog and the other-device case in the
+    stand-in, and on a "Getting ready" phase longer than 15 s.
+
+- **An objection right before the meeting ends was lost** (since 0.6.0). When the host ended the meeting, or removed
+  Bosun, between two chat reads, Bosun finished first and kept the recording. It now reads the chat once more and
+  an objection still deletes the recording.
+- **Captions or a meeting title could end a meeting.** Once in the call, "the meeting has ended" or "you have been
+  removed" now only counts in the platform's own dialogs (and headings, once the call's controls are gone). Captions, the meeting title and the rest of the page are
+  participants' words. Before the call, the whole page still counts.
+
+### Documented
+
+- README: Zoom, the signed-in Meet lobby, and keepalive advice for the meeting profiles (keep them signed in,
+  check `keepalive_list` before an important meeting, and how keepalive visits and meetings share a profile).
+
+### Not tested live
+
+- The signed-in Meet changes and all of Zoom were tested against local stand-ins of the pages (`test/fakemeet.mjs`,
+  `test/fakezoom.mjs`) and, on Linux, with the real audio pipeline. No live meeting was joined for this release.
+
+## 0.8.0 — security hardening: Chromium sandbox, host allowlist, download budget
+
+From an external security review of 0.7.0 ([docs/SECURITY-REVIEW-0.7.0.md](docs/SECURITY-REVIEW-0.7.0.md)) and the
+hardening contributed with it.
+
+### Changed — read before upgrading
+
+- **Chromium runs with its own sandbox** (`CHROMIUM_SANDBOX=1`, the default). 0.7.0 ran it with Playwright's
+  `--no-sandbox`, so a compromised renderer landed directly on the service user. On Linux, **startup now launches the
+  browser once and refuses to start** if the sandbox cannot be set up, printing what the host needs: unprivileged
+  user namespaces, an AppArmor profile that grants `userns`, or the setuid helper (see README › Chromium sandbox and
+  docs/DEPLOY-SYSTEMD.md). `CHROMIUM_SANDBOX=0` runs unsandboxed and says so at every start.
+- **Downloads are refused by default** (`DOWNLOADS=0` → `acceptDownloads: false`). No tool used them, and a page
+  could write unbounded files into Playwright's temp directory (often RAM-backed). `DOWNLOADS=1` turns them on, with
+  `DOWNLOADS_MAX_MB` per session (100) and `DOWNLOADS_TOTAL_MAX_MB` service-wide (500): a download past either
+  budget is cancelled, or deleted if it finished first.
+
+### Added
+
+- **Per-tenant host allowlist**, `BROWSER_TENANT_ALLOW='ops=*.example.org,127.0.0.1:4848; swarm=*.example.org'`.
+  - A named tenant gets its own forward proxy inside the service (loopback, a password of its own), and each of
+    its sessions runs in a browser of its own launched with it (a temporary profile, removed with the session), so
+    every connection is checked before it leaves: navigations, each redirect hop,
+    subresources, page and worker WebSockets, service workers, prefetches.
+  - The proxy resolves DNS itself and connects to the address it checked. A name that resolves into a private range
+    is refused unless the allowlist names that address.
+  - QUIC is off and WebRTC is limited to the proxy: Chromium flags, the `webrtc.ip_handling_policy` profile
+    preference (full Chromium — headful, patchright — ignores the flag), and Firefox preferences for camoufox (which
+    also needs `network.proxy.allow_hijacking_localhost` to send loopback through the proxy).
+  - `navigate` and `keepalive_set` refuse hosts outside the list up front. `navigate` reports a refused redirect as
+    `refused: "host allowlist"`, or, for an `https` hop refused at `CONNECT`, with an error naming host and port.
+  - Denials are logged as host and port, never a path or query.
+  - A tenant without an allowlist gets no proxy and the same shared browser as before.
+- **Feature switches**: `FEATURES_MEETINGS=0` drops the meeting tools and their machinery; `FEATURES_ENGINES` limits
+  the engines a session may pick. Both default to everything on, as before.
+- `docs/DEPLOY-SYSTEMD.md` and `deploy/` (unit and env example): a hardened systemd deployment.
+- Tests for all of the above, including an engine matrix for the allowlist (`ENGINE=patchright|camoufox npm test`)
+  and a standing test of what credential masking does not cover.
+
+### Fixed
+
+- **camoufox: a WebSocket opened in a worker could end the service.** Playwright's Firefox driver hits an internal
+  assertion on that WebSocket's events, which surfaced as an unhandled rejection, and Node exits on those, taking every
+  tenant's sessions and handoffs with it. A rejection from inside the browser driver is now logged
+  (`bosun: browser driver error, ignored: …`) and the service keeps serving; any other unhandled rejection still ends
+  the process.
+
+### Documented
+
+- On `chromium` a page can neutralize the credential-masking helpers (they run in its JavaScript world), and on any
+  engine a page can copy what the human typed into ordinary text. The page where a credential is typed must be
+  trusted (review finding H2).
+
 ## 0.7.0 — read-only tokens for subagents
 
 ### Added

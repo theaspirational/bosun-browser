@@ -6,14 +6,11 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 > Status: **prototype (M0)**. Works end to end in one deployment; APIs will change. See [docs/DESIGN.md](docs/DESIGN.md)
 > and [CHANGELOG.md](CHANGELOG.md).
 
-> **This is a fork.** It adds a [per-tenant host allowlist](#per-tenant-host-allowlist)
-> (`BROWSER_TENANT_ALLOW`), enforced by a forward proxy inside the service that is the browser's only way out, runs
-> Chromium **with its own sandbox** ([`CHROMIUM_SANDBOX`](#chromium-sandbox)), and
-> turns three things off by default: meetings (`FEATURES_MEETINGS=0`), every engine but `chromium`
-> (`FEATURES_ENGINES=chromium`) and downloads (`DOWNLOADS=0`). It also ships a Linux deployment guide
-> ([docs/DEPLOY-SYSTEMD.md](docs/DEPLOY-SYSTEMD.md)). What was reviewed before adopting it, and what is still risky,
-> is written down in [docs/FORK-SECURITY-REVIEW.md](docs/FORK-SECURITY-REVIEW.md). Nothing else was removed, so
-> upstream merges stay easy: the switches are configuration, not deletions.
+> Security: Chromium runs **with its own sandbox** ([`CHROMIUM_SANDBOX`](#chromium-sandbox)), downloads are refused
+> by default (`DOWNLOADS=0`), and a tenant can be kept to a [host allowlist](#per-tenant-host-allowlist)
+> (`BROWSER_TENANT_ALLOW`). A review of 0.7.0, and what is still risky, is in
+> [docs/SECURITY-REVIEW-0.7.0.md](docs/SECURITY-REVIEW-0.7.0.md); a Linux deployment guide is in
+> [docs/DEPLOY-SYSTEMD.md](docs/DEPLOY-SYSTEMD.md).
 
 ## What it does today
 
@@ -24,16 +21,20 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 - MCP server over **stdio** (Claude Code, Codex, …) or **WebSocket** (shared service).
 - Tools: `session_open` / `session_close` / `sessions`, `navigate`, `read` (accessibility snapshot with element
   refs), `click`, `type`, `select`, `press`, `back`, `wait_for`, `screenshot`, `request_human`, `handoff_wait`,
-  `keepalive_set` / `keepalive_list` / `keepalive_remove`, and — with `FEATURES_MEETINGS=1`, off by default in this
-  fork — `meeting_join` / `meeting_status` / `meeting_chat_read` / `meeting_chat_send` / `meeting_stop_recording` /
+  `keepalive_set` / `keepalive_list` / `keepalive_remove`, `upload_create` / `upload` (unless `FEATURES_UPLOADS=0`),
+  and (unless `FEATURES_MEETINGS=0`) `meeting_join` /
+  `meeting_status` / `meeting_chat_read` / `meeting_chat_send` / `meeting_stop_recording` /
   `meeting_leave` / `meeting_recording_delete`.
 - **Keepalive** for persistent profiles: scheduled visits keep sliding login sessions alive without a model, and a
   logged-out profile raises an MCPL `bosun:needs-human` push event. A visit can also **watch** one value (say, a
   "43 neue Nachrichten" counter) and push `bosun:watch-changed` when it goes up. See
   [Keeping logins alive](#keeping-logins-alive) and [Watching a value](#watching-a-value).
-- **Meetings (PoC):** joins a Google Meet as a guest notetaker, announces itself in the chat, records the audio to a
-  file and leaves; a "please don't record" in the chat stops and deletes the recording. Transcription happens later,
+- **Meetings (PoC):** joins a Google Meet (as a guest or signed in) or a Zoom meeting (signed in, in Zoom's web
+  client) as a notetaker, announces itself in the chat, records the audio to a file and leaves; a "please don't record" in the chat stops and deletes the recording. Transcription happens later,
   from the file. See [Meetings (PoC)](#meetings-poc).
+- **File uploads** into pages: the agent sends the file with one `curl -T` to a one-time URL on the MCP port
+  (streamed to disk, up to 300 MB), then `upload` puts it into a file input, answers the file chooser a button
+  opens, or drops it on a drop zone. See [Uploading files](#uploading-files).
 - Sessions are **ephemeral** (wiped on close) or use a named **persistent profile** of the tenant (stays logged in;
   no RAM while idle). A session belongs to the connection that opened it: other connections can't see, use or close
   it, and it is closed when that connection goes away or after `IDLE_TIMEOUT_SEC` without use.
@@ -84,8 +85,13 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `BROWSER_TOKEN_POLICIES` | – (all `full`) | per-tenant policy: `swarm=ephemeral` (see [Read-only tokens for subagents](#read-only-tokens-for-subagents)) |
 | `BROWSER_EPHEMERAL_MAX_SESSIONS` | 2 | session cap of each `ephemeral` tenant (at most `MAX_SESSIONS_PER_TENANT`) |
 | `BROWSER_TENANT_ALLOW` | – (unrestricted) | per-tenant host allowlist, enforced by a per-tenant forward proxy: `ops=*.example.org,127.0.0.1:4848; swarm=*.example.org` (see [Per-tenant host allowlist](#per-tenant-host-allowlist)) |
-| `FEATURES_MEETINGS` | `0` | `1` = list and wire the meeting tools (this fork: off) |
-| `FEATURES_ENGINES` | `chromium` | engines a session may ask for, comma list; `ENGINE` is always included |
+| `FEATURES_MEETINGS` | `1` | `0` = the meeting tools are not listed and their handlers not wired |
+| `FEATURES_UPLOADS` | `1` | `0` = no upload tools and no PUT endpoint |
+| `UPLOAD_MAX_BYTES` | 314572800 (300 MB) | largest file one upload may carry |
+| `UPLOAD_TENANT_QUOTA_BYTES` | 1073741824 (1 GB) | uploaded bytes one tenant may hold at a time (at least `UPLOAD_MAX_BYTES`) |
+| `UPLOAD_TTL_SEC` / `UPLOAD_URL_TTL_SEC` | 3600 / 900 | an uploaded file is deleted this long after it arrived; an upload URL is valid this long |
+| `UPLOAD_BASE_URL` | – (the `Host` the client connected with, `http://`) | where tenants reach the MCP port, for the PUT URL; set it behind TLS or another name |
+| `FEATURES_ENGINES` | all three | engines a session may ask for, comma list (e.g. `chromium`); `ENGINE` is always included |
 | `CHROMIUM_SANDBOX` | `1` | `0` = run Chromium without its own sandbox (logged at every start); see [Chromium sandbox](#chromium-sandbox) |
 | `DOWNLOADS` | `0` | `1` = let pages download files (with the budget below); `0` = the context refuses them |
 | `DOWNLOADS_MAX_MB` / `DOWNLOADS_TOTAL_MAX_MB` | 100 / 500 | downloaded bytes a session, and the whole service, may keep |
@@ -121,13 +127,67 @@ All numbers are validated at startup; a bad value stops the service instead of s
 | `patchright` | a browser per session (persistent context; temp profile for ephemeral sessions) | CDP screencast | patchright's recommended setup: no custom UA, no automation-flag args, window-sized viewport |
 | `camoufox` | a browser per session | Playwright screencast + `page.mouse`/`keyboard` | fingerprint (window, screen, fonts, UA) from Camoufox; `humanize` off (hangs clicks with Playwright 1.64) |
 
-Only the engines in `FEATURES_ENGINES` (default `chromium`, plus whatever `ENGINE` is set to) can be asked for;
+Only the engines in `FEATURES_ENGINES` (default: all three; `ENGINE` is always included) can be asked for;
 `session_open`'s schema lists exactly those, and the session manager refuses the others. A session asking for an
 engine that is enabled but isn't installed gets an error naming the install command; there is no silent
 fallback to another engine. A persistent profile remembers its engine family (Chromium or Firefox) and refuses the
 other. patchright and camoufox-js are `optionalDependencies`; their browsers are separate downloads.
 
 Chromium spawns many threads: under systemd give the unit a generous `TasksMax` (e.g. 2000).
+
+## Uploading files
+
+Two calls and a `curl` between them:
+
+```text
+upload_create { filename: "report.pdf", size_bytes: 48213 }
+  -> { file_id: "f3a…", put_url: "http://127.0.0.1:8002/upload/f3a…?t=…",
+       curl: "curl -sS --fail-with-body -T 'report.pdf' 'http://127.0.0.1:8002/upload/f3a…?t=…'", valid_min: 15 }
+$ curl -sS --fail-with-body -T report.pdf 'http://127.0.0.1:8002/upload/f3a…?t=…'
+  -> {"file_id":"f3a…","filename":"report.pdf","size":48213}
+upload { session, selector: "input[type=file]", file_id: "f3a…" }      # or ref / role+name / text
+  -> { method: "input", input_files: ["report.pdf"], url, title }
+click { session, role: "button", name: "Send" }
+```
+
+- **Where the bytes go.** The PUT goes to the same host and port as MCP (the URL is built from the `Host` the MCP
+  client connected with, or `UPLOAD_BASE_URL`), so whatever reaches MCP reaches it. The body is streamed straight to
+  `BROWSER_DATA/uploads/<tenant>/<file_id>/<filename>` (0600): never held in memory, never base64. The browser
+  reads the file from there itself; no bytes cross the MCP connection.
+- **The URL works once,** for `UPLOAD_URL_TTL_SEC` (15 min), and only for the tenant that asked for it. Its secret
+  (`?t=`) is the credential. Instead of it, `PUT /upload/<file_id>` with the tenant's own token in
+  `Authorization: Bearer` works too; another tenant's token is refused either way.
+  `size_bytes` is optional; when given, the PUT must carry exactly that many bytes.
+- **Small files** (up to 1 MB): `upload_create { filename, content_base64 }` stores the file at once, no PUT.
+- **Limits.** `UPLOAD_MAX_BYTES` per file (300 MB) and `UPLOAD_TENANT_QUOTA_BYTES` per tenant (1 GB) are checked
+  against `Content-Length` before any byte is read, and again while the body streams: past either, the answer is
+  `413` and nothing stays on disk. A tenant holds at most 50 uploads at a time (waiting, arriving or ready), and
+  streams at most 4 at once (16 across the service); past that a PUT gets `429` and its URL stays valid.
+- **Files never cross tenants.** A `file_id` of another tenant answers like one that never existed.
+- **Deletion.** A file is deleted when the session that used it closes (the last one, if several did),
+  `UPLOAD_TTL_SEC` (1 h) after it arrived, or when the service starts. Submit the form within the hour.
+- **Read-only tokens** (policy `ephemeral`) can't upload: the tools are refused, and so is a PUT with such a token.
+
+How `upload` puts the files in:
+
+1. The element is an `<input type=file>`, hidden or not, or the `<label>` of one: the input gets the files
+   directly. Several files (`files: [id, id]`) only when it has `multiple`.
+2. Anything else (an "Upload" button, a link) is clicked, and the file chooser it opens is answered.
+3. If no chooser opens within 5 s, the files are **dropped** on the element: `dragenter`, `dragover`, `drop` with
+   the files in a `DataTransfer`. `accepted` says whether something on the page took the drop.
+
+`method: input | chooser | drop` forces one of them.
+
+Drag-and-drop is best effort:
+- The events are synthetic (`isTrusted` is false). A drop zone that checks for real user events ignores them.
+- On `camoufox`, Firefox hides files dropped from outside the page's own scripts, so Bosun dispatches the drop
+  from a script element in the page. A page whose Content-Security-Policy refuses inline scripts gets no files;
+  `note` says so. Use `chromium` for that page.
+- An element inside a shadow root may not be found by the camoufox drop script; drop on its host, or use another
+  engine.
+
+Prefer the page's file input or its "Upload" button where there is one: both are as good as a person picking a
+file.
 
 ## Handoff
 
@@ -163,7 +223,7 @@ Chromium spawns many threads: under systemd give the unit a generous `TasksMax` 
   input that ever was `type=password` (incl. shadow roots), and Bosun also notes them when a handoff starts and every
   500 ms during it. On `chromium` Bosun's helpers run in the page's own JavaScript world, so a page can detect them
   — and replace them, which switches masking off for fields that aren't sensitive by markup (probed, see
-  [docs/FORK-SECURITY-REVIEW.md](docs/FORK-SECURITY-REVIEW.md) finding H2); on `patchright` and `camoufox` they run
+  [docs/SECURITY-REVIEW-0.7.0.md](docs/SECURITY-REVIEW-0.7.0.md) finding H2); on `patchright` and `camoufox` they run
   in an isolated world, which stops that and nothing else (details in [docs/ENGINES.md](docs/ENGINES.md)).
 - Not protected: text the human types into ordinary fields, secrets the page itself echoes as normal text, custom
   widgets that aren't `<input>`/`<textarea>` (e.g. per-digit OTP boxes built from `div`s), closed shadow roots.
@@ -274,18 +334,23 @@ arrived on average and up to about 40 minutes after (longer in quiet hours). Sev
 
 ## Meetings (PoC)
 
-> Off by default in this fork: set `FEATURES_MEETINGS=1` to list the tools and wire their handlers. With `0` nothing
-> of the below runs — no recordings directory, no audio server. Read the consent notes before turning it on.
+> `FEATURES_MEETINGS=0` switches meetings off: the tools are not listed and their handlers are not wired, and nothing
+> of the below runs — no recordings directory, no audio server. Read the consent notes before using them.
 
-Bosun can attend a **Google Meet** as a notetaker: it joins as an **unauthenticated guest**, or with a Bosun
-profile that is **signed in to a Google account**, records the meeting's audio and leaves. Nothing is transcribed live: the agent gets the recording when the meeting ends and transcribes it
-afterwards with whatever it likes. Zoom and Teams are not supported yet; the Meet-specific parts live in
-`src/meetings/platforms/meet.mjs` behind a small platform interface, so another platform is one more file.
+Bosun can attend a **Google Meet** or a **Zoom** meeting as a notetaker, record its audio and leave.
+- **Meet:** as an **unauthenticated guest**, or with a Bosun profile **signed in to a Google account**.
+- **Zoom:** in Zoom's web client, with a Bosun profile **signed in to a Zoom account**. Zoom turns most anonymous
+  browser guests away, so a guest join usually ends with `sign-in-required` or `captcha`.
+
+Nothing is transcribed live. The agent gets the recording when the meeting ends and transcribes it afterwards with
+whatever it likes. Teams is not supported yet. Each platform lives in one file under `src/meetings/platforms/`
+(`meet.mjs`, `zoom.mjs`) behind a small interface, and the meeting flow around it is shared.
 
 ```jsonc
 meeting_join({ "url": "https://meet.google.com/abc-defg-hij" })   // name, announce_text, max_wait_admit_min (10),
                                                                    // profile, engine, leave_on_optout (true)
-//  -> { "meeting_id": "m1a2b3c4d5e6", "state": "waiting", ... }   once the join request is out
+meeting_join({ "url": "https://us02web.zoom.us/j/81234567890?pwd=…", "profile": "zoom" })
+//  -> { "meeting_id": "m1a2b3c4d5e6", "platform": "zoom", "state": "waiting", "joined_as": "account", ... }
 meeting_status({ "meeting_id": "m1a2b3c4d5e6" })   // joining | waiting | admitted | recording | ended, participants, recording_seconds
 meeting_chat_read({ "meeting_id": "…", "since": 0 })      meeting_chat_send({ "meeting_id": "…", "text": "…" })
 meeting_stop_recording({ "meeting_id": "…", "delete": true })   meeting_leave({ "meeting_id": "…" })
@@ -297,22 +362,39 @@ meeting_recording_delete({ "meeting_id": "…" })
 1. **Browser:** a fresh browser of its own, or `profile` (Chromium or patchright only; camoufox is refused).
    - Media permission prompts are accepted (`--use-fake-ui-for-media-stream`), but no fake devices are used: the
      microphone is a silent audio source and there is no camera.
-   - The browser asks for Meet's **English UI** (`hl=en`, Accept-Language `en-US`). Since the account or region can
-     still win, every text and label is also recognized in German, Slovak, Ukrainian and Russian.
+   - The browser asks for an **English UI** (Meet: `hl=en`; Zoom: its language cookie; both: Accept-Language
+     `en-US`). The account or region can still win, so Meet's texts and labels are also recognized in German,
+     Slovak, Ukrainian and Russian, and Zoom's in German and Ukrainian (some Russian).
+   - **Zoom links** (`zoom.us/j/<id>?pwd=…`, any `*.zoom.us` subdomain, webinar `/w/` and web client `/wc/`
+     links) are rewritten to the web client, `https://app.zoom.us/wc/<id>/join?pwd=…`, so Zoom's "open the app"
+     page doesn't come up. If it does anyway, Bosun clicks "Launch Meeting" and then "Join from your browser".
 2. **Lobby:**
    - Microphone and camera must be **verifiably off** before joining. Bosun switches a device off and checks it,
      unless Meet shows the device doesn't exist ("Camera not found" / "Kamera nicht gefunden") and no control shows
      it on; then it already counts as off. If neither can be confirmed, Bosun does not join.
-   - A guest types its name (default `Glassy (notetaker)`); a signed-in profile has no name field and joins under
-     the account's name.
-   - Then **Ask to join** / **Teilnahme erbitten** / **Join now**, and Bosun waits up to `max_wait_admit_min`.
+   - A guest types its name (default `Glassy (notetaker)`). A signed-in Meet profile has no name field and joins
+     under the account's name, so `name` is ignored. Zoom fills in a signed-in account's name, and Bosun keeps it.
+   - Tips and dialogs over the lobby ("Do you want people to hear you in the meeting?", "Got it", cookie banners,
+     "This meeting is being recorded") are closed. Only buttons inside a dialog or banner are clicked.
+   - Then **Ask to join** / **Join now** / **Teilnahme erbitten** (Meet) or **Join** (Zoom). A join button that
+     is still disabled ("Getting ready...") is waited for, up to 25 s. Bosun then waits up to
+     `max_wait_admit_min` for admission. `meeting_status` shows `joined_as`: `account` or `guest`.
+   - **Meet, account already in the call on another device:** Meet offers "Switch here", which would drop the
+     other device. Bosun picks **"Join here too"** (directly, or under "Other ways to join") and uses "Switch here"
+     only when Meet offers nothing else.
 3. **Not getting in:**
    - A denied request or no admission in time ends the meeting with a clear error.
    - **Google turning the guest away** ("You can't join this video call" / "Sie können nicht an diesem Videoanruf
      teilnehmen" after asking, with no waiting room seen) ends with reason `refused_by_google`.
    - That refusal comes with a hint: join with a signed-in profile, or from a residential IP. It is not a captcha,
      and `navigate` reports it as a refusal too.
-4. Once admitted, Bosun opens the chat and **posts the announcement first**. Only then does recording start. The
+   - Zoom ends a join early with `invalid-meeting` (wrong meeting ID or passcode, or a link without `?pwd=` for a
+     meeting that has one; the link's `pwd` is an encrypted token and is never typed into a passcode field), `sign-in-required` (the host admits only signed-in users) or `captcha` (a visible
+     challenge before joining). Being removed from Zoom's waiting room counts as `denied`.
+4. Once admitted (Zoom: computer audio joined first, since without it nothing is heard, then microphone and
+   camera checked off again), Bosun opens the chat and **posts the announcement first**. On Zoom the chat is set to
+   Everyone first, and the announcement has to show up in the chat, not marked as private. If Zoom allows chat with
+   the host only, or the message doesn't show up, Bosun leaves without recording. Only then does recording start. The
    default text is in English and German: *"Hi, I'm Glassy, an AI notetaker. I'm recording audio for notes. If you'd
    rather not be recorded, just say so here in chat (e.g. 'please don't record') and I'll stop and delete the
    recording."* With `MEETING_OWNER` set it says whose notetaker it is.
@@ -324,12 +406,20 @@ meeting_recording_delete({ "meeting_id": "…" })
    - On leaving, `bosun:meeting-ended` carries `meeting_id`, `reason`, `duration_s`, `bytes` and the `recording`:
      path, a `file://` URI and size. The payload also has it as an MCP `resource_link`.
 
-**Signed-in profile.** Google turns away anonymous automated guests far more often than signed-in users.
-- **Setup:** `session_open({ "profile": "google" })`, `navigate` to `https://accounts.google.com`, `request_human`
-  so a person signs in, `session_close`.
-- **Joining:** `meeting_join({ "url": "…", "profile": "google" })`.
+**Signed-in profile.** Google turns away anonymous automated guests far more often than signed-in users, and Zoom
+admits almost no anonymous browser guests at all.
+- **Setup:** `session_open({ "profile": "google" })`, `navigate` to `https://accounts.google.com` (Zoom:
+  `https://zoom.us/signin`), `request_human` so a person signs in, `session_close`.
+- **Joining:** `meeting_join({ "url": "…", "profile": "google" })` or `{ …, "profile": "zoom" }`.
 - **Engine:** the profile is opened with the engine it was last used with. It can't be in use by an agent session at
   the same time.
+- **Keep it signed in.** Both sign-ins expire when nobody uses them. Give each profile a keepalive, for example
+  `keepalive_set({ "profile": "google", "url": "https://myaccount.google.com/", "every_hours": 24 })` and
+  `keepalive_set({ "profile": "zoom", "url": "https://zoom.us/profile", "every_hours": 24 })`, and look at
+  `keepalive_list` before an important meeting. A `logged_out` result means a person has to sign in again.
+- **Keepalive and meetings share the profile.** A meeting that starts while a keepalive visit has the profile open
+  takes it over, and a visit that comes due during a meeting is skipped and runs at its next slot. With
+  `MAX_SESSIONS=2`, a meeting and one agent session fill the service, so a keepalive visit then waits too.
 
 The meeting runs in a session of its own, so it outlives the agent's connection. It counts against `MAX_SESSIONS`.
 Events use the MCPL feature set **`bosun.meeting`** (tags `bosun:meeting-chat`, `bosun:meeting-optout`,
@@ -376,9 +466,18 @@ Meetings need a **headful** browser (headless Chromium plays no audio), so run t
 - **Google reviews bot-like guests.** Join requests from automated browsers can land in a review queue or be refused
   outright ("You can't join this video call", reason `refused_by_google`). Datacenter IPs make this much more
   likely. A signed-in profile or a residential connection works best.
-- **Meet's markup changes without notice.** Labels and texts are matched in English, German, Slovak, Ukrainian and
-  Russian (English is requested); the chat sender name is a best-effort guess. A change on Google's side breaks the join or the chat watch until
-  `platforms/meet.mjs` is updated. This PoC has been tested against a local Meet stand-in, not against live Meet.
+- **Meet's and Zoom's markup changes without notice.** Labels and texts are matched in several languages (English
+  is requested), and the chat sender name is a best-effort guess. A change on Google's or Zoom's side breaks the
+  join or the chat watch until `platforms/meet.mjs` or `platforms/zoom.mjs` is updated.
+- **Tested against stand-ins.** The tests run against local stand-ins (`test/fakemeet.mjs`, `test/fakezoom.mjs`)
+  built from how the real pages look. The signed-in Meet lobby (dialogs, "Getting ready...", "Join here too") and
+  all of Zoom are new in 0.9.0 and have not had a live run yet. The Zoom chat watch depends most on Zoom's markup
+  and is the part most likely to need a fix after the first live meeting.
+- **Zoom may connect computer audio with the microphone on.** Bosun mutes it as soon as the control appears. The
+  browser's microphone is a silent source, so only silence can go out in that moment, and the server has no camera.
+- **An objection in the last second before Zoom leaves the page can be missed.** Bosun reads the chat once more
+  when a meeting ends, but if Zoom has already navigated to its end page, messages it hadn't read yet are gone.
+  The recording is then kept; the agent can still delete it with `meeting_recording_delete`.
 - **One mixed audio track.** There is no speaker separation and no live transcript.
 - **Consent is the operator's responsibility.** The announcement and the opt-out are a courtesy, not a legal basis.
   Check what applies where the participants are; some places require everyone's explicit consent before recording.
@@ -406,7 +505,8 @@ With policy `ephemeral` the server enforces, not just hides:
   the connection and close when it closes (or after `IDLE_TIMEOUT_SEC`).
 - Nothing is written to `BROWSER_DATA`: screenshots are returned but never saved, even with `SAVE_SHOTS=1`. Ephemeral
   sessions use temporary browser profiles that are deleted on close; Playwright keeps downloads in its own temporary
-  directory and deletes them with the session. There is no upload tool.
+  directory and deletes them with the session. `upload_create` and `upload` are refused, and so is an upload PUT
+  that carries this token.
 - No MCPL push events.
 
 A policy only narrows what the token can do; the tenant is still separate from yours, so it never sees your profiles
@@ -424,7 +524,7 @@ stdin/stdout and the WebSocket, one message per frame.
   "env": { "BOSUN_URL": "ws://127.0.0.1:7360", "BOSUN_TOKEN": "<swarm token>" } } } }
 ```
 
-Records are split on LF only (CRLF is accepted); a record that is not JSON or is over 1 MiB is dropped with a line
+Records are split on LF only (CRLF is accepted); a record that is not JSON or is over 2 MiB is dropped with a line
 on stderr. The opening handshake times out after 15 s. Exit codes: `0` stdin ended, `1` connection failed or lost,
 `2` bad configuration (missing variable, a non-ws URL, credentials in the URL), `3` token refused. The bridge needs
 only Node and the `ws` package.
@@ -432,8 +532,8 @@ only Node and the `ws` package.
 ## Chromium sandbox
 
 The browser parses untrusted web content, so it runs with **Chromium's own sandbox** (`chromiumSandbox: true`,
-which is what `CHROMIUM_SANDBOX=1`, the default, means). Playwright's default is `--no-sandbox`; this fork does not
-use it.
+which is what `CHROMIUM_SANDBOX=1`, the default, means). Playwright's default is `--no-sandbox`; Bosun does not use
+it (0.7.0 and earlier did).
 
 The sandbox needs something from the host, and startup checks it: Bosun starts the browser once, closes it again,
 and **refuses to run** if that fails, printing what to do. On Linux, one of these has to be true:
@@ -476,10 +576,16 @@ Entries are separated by `;` (or newlines), hosts within an entry by `,`. A host
 ### How it is enforced
 
 A tenant that is named gets **its own forward proxy inside the service** (`src/proxy.mjs`, on loopback, with a
-random password of its own) **and a browser of its own**, launched with that proxy as its only way out
+random password of its own), and **each of its sessions runs in a browser of its own** (a temporary profile,
+removed with the session), launched with that proxy as its only way out
 (`--proxy-bypass-list=<-loopback>`, so not even loopback is exempt; QUIC off and WebRTC's non-proxied UDP off, so
-nothing can go around it; Chromium does not fall back to a direct connection when a proxy refuses). Those flags
-belong to that browser alone — tenants without an allowlist share a browser launched exactly the way upstream
+nothing can go around it; Chromium does not fall back to a direct connection when a proxy refuses). Full Chromium
+(headful, `patchright`) ignores the WebRTC flag, so the browser's profile also gets the `webrtc.ip_handling_policy`
+preference before every proxied launch (a persistent profile loses it again on an unproxied launch, if Bosun set
+it).
+`camoufox` gets the same as Firefox preferences: loopback through the proxy too
+(`network.proxy.allow_hijacking_localhost`), WebRTC through the proxy only, no HTTP/3, no DNS prefetching. Those
+settings belong to that browser alone — tenants without an allowlist share a browser launched exactly the way upstream
 launches it, so one tenant's allowlist never changes another tenant's networking. Every
 connection the browser wants — a navigation, each hop of a redirect, a subresource, XHR, a WebSocket from the page
 **or from a worker**, a service-worker fetch, a prefetch — arrives at the proxy as a request or a `CONNECT` and is
@@ -487,6 +593,8 @@ checked against the allowlist before a byte leaves the host:
 
 - A denied connection is never made. The browser gets `403` from the proxy, so a denied navigation leaves the tab
   on that URL with the proxy's one-line reason and `navigate` reports `status: 403` and `refused: "host allowlist"`.
+  An `https://` hop is refused at `CONNECT`, which fails the navigation in the browser; `navigate` then answers
+  "navigation refused by the host allowlist of this token: <host>:<port>".
 - Denials are logged as `bosun: tenant <t>: blocked <host>:<port> — <reason>`: host and port, never a path or a
   query. One line per target per tenant (a repeat is counted, not logged again).
 - **DNS is resolved by the proxy, once**, and the connection goes to that address, so the address a decision was
@@ -513,7 +621,7 @@ A tenant that is not named is unrestricted: no proxy, nothing intercepted, and a
 - Plain `http://` goes through the proxy as HTTP/1.1 (no h2c, no QUIC); `https://` is end-to-end inside the tunnel.
 - A firewall is still the outer boundary: the proxy is a per-tenant rule inside the service, not a replacement for
   network egress policy (see [Security notes](#security-notes) and
-  [docs/FORK-SECURITY-REVIEW.md](docs/FORK-SECURITY-REVIEW.md)).
+  [docs/SECURITY-REVIEW-0.7.0.md](docs/SECURITY-REVIEW-0.7.0.md)).
 
 ## Security notes
 
@@ -531,21 +639,24 @@ A tenant that is not named is unrestricted: no proxy, nothing intercepted, and a
 - A named tenant can be kept to a list of hosts, enforced by a per-tenant forward proxy that is the browser's only
   way out (see [Per-tenant host allowlist](#per-tenant-host-allowlist)). That narrows what the agent, the page, its
   workers and its service workers can reach; it does not replace the egress boundary above.
-- The browser runs with its own sandbox (see [Chromium sandbox](#chromium-sandbox)). Upstream's default, and this
-  fork's with `CHROMIUM_SANDBOX=0`, is `--no-sandbox`: then a renderer compromise is directly on the service user,
+- The browser runs with its own sandbox (see [Chromium sandbox](#chromium-sandbox)). Without it (0.7.0 and earlier,
+  or `CHROMIUM_SANDBOX=0`) Chromium runs with `--no-sandbox`: then a renderer compromise is directly on the service user,
   which is where the profiles and the service's environment (tokens included) are.
 - Downloads are off by default (`DOWNLOADS=0`), and bounded by a disk budget when enabled, so a page cannot fill
   the volume.
+- Uploads are written to `BROWSER_DATA/uploads` (on the data volume, not a RAM-backed `/tmp`) under a per-file cap
+  and a per-tenant quota, and deleted after use, after an hour and at every start. Once a file is in a page, the page
+  can send it anywhere it can reach: upload only what you would hand that site.
 - Credential masking around a handoff covers credential **fields** — their value, and values Bosun saw in them. A
   page that copies what the human typed into ordinary text, or into something it reads later, is not masked on
   **any** engine, and on `chromium` a page can also neutralize the masking helpers outright (they run in its own
   JavaScript world; `patchright` uses an isolated one, which stops that technique and nothing more). Treat the page
   where a credential is typed as trusted, or don't type it there. Details, probes and the standing test:
-  [docs/FORK-SECURITY-REVIEW.md](docs/FORK-SECURITY-REVIEW.md) (finding H2).
+  [docs/SECURITY-REVIEW-0.7.0.md](docs/SECURITY-REVIEW-0.7.0.md) (finding H2).
 
 ## Roadmap
 
-M1 meetings beyond the PoC (Zoom, Teams, speaker separation), tenant quotas/audit log, mobile viewport for handoff, more push events (handoff done/timeout) · M2 vault (`fill_credential`), downloads as content
+M1 meetings beyond the PoC (Teams, speaker separation), tenant quotas/audit log, mobile viewport for handoff, more push events (handoff done/timeout) · M2 vault (`fill_credential`), downloads as content
 references, watching pages outside keepalive visits · M3 macros.
 
 ## License

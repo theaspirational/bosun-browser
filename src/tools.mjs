@@ -1,5 +1,6 @@
 // MCP tool surface. One McpServer per connection; every session lookup is scoped to that connection (owner).
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import crypto from 'crypto';
 import { z } from 'zod';
 import { countNodes, maskText, maskedScreenshot, sensitiveValues } from './redact.mjs';
 import { NOT_ALLOWED, PROFILES_REFUSED, TENANT_RE } from './auth.mjs';
@@ -9,6 +10,7 @@ export { httpUrl };
 import { MANIFEST, mcplConnection } from './events.mjs';
 import { MIN_PERIOD_MIN } from './keepalive.mjs';
 import { meetRefusalPage } from './meetings/platforms/meet.mjs';
+import { BASE64_MAX_BYTES } from './uploads.mjs';
 
 const MAX_SHOT_PX = 8000; // tallest full-page screenshot, CSS px
 const POLL_SEC = 50; // default handoff wait: below the MCP SDK's 60 s request timeout
@@ -78,17 +80,113 @@ function locate(p, t) {
 const str = (n) => z.string().max(n);
 const target = { ref: str(20).optional().describe('element ref from read (e.g. "e12")'), role: str(40).optional(), name: str(1000).optional(), selector: str(2000).optional(), text: str(1000).optional() };
 const hasTarget = (a) => !!(a.ref || a.role || a.selector || a.text);
+const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+
+// Runs in the page: drags the files of input i onto el (dragenter, dragover, drop, dragleave). true when the page
+// cancelled dragover or drop, i.e. something there takes drops. mark: leave the answer on el (main-world run).
+function dropFiles(el, i, mark) {
+  const dt = new DataTransfer();
+  for (const f of i.files) dt.items.add(f);
+  const r = el.getBoundingClientRect();
+  const at = { bubbles: true, cancelable: true, composed: true, dataTransfer: dt, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+  el.dispatchEvent(new DragEvent('dragenter', at));
+  const over = !el.dispatchEvent(new DragEvent('dragover', at));
+  const drop = !el.dispatchEvent(new DragEvent('drop', at));
+  el.dispatchEvent(new DragEvent('dragleave', at));
+  if (mark) el.setAttribute('data-bosun-res', String(over || drop));
+  return over || drop;
+}
+
+// Puts files (paths on this machine) into the page through the element: an <input type=file> (also a hidden one, or
+// a label of one) directly; anything else is clicked and the file chooser it opens is answered; if none opens, the
+// files are dropped onto it (synthetic drag events, best effort). method forces one of them. The browser reads the
+// files from disk itself: no bytes pass through this process or the protocol.
+// mainWorld (camoufox): Firefox hides files that our isolated world put into a DataTransfer from the page, so the drop
+// is dispatched by a script element in the page's own world (unless the page's CSP refuses inline scripts).
+async function putFiles(page, l, paths, method, { mainWorld = false } = {}) {
+  const input = await l.evaluate((el) => {
+    const i = el.tagName === 'INPUT' ? el : el.tagName === 'LABEL' ? el.control : null;
+    return i && i.type === 'file' ? { multiple: i.multiple, disabled: i.disabled } : null;
+  }, null, { timeout: 15000 });
+  const many = paths.length > 1;
+  if (input && method !== 'drop' && method !== 'chooser') {
+    if (many && !input.multiple) throw new Error(`this file input takes one file (no multiple attribute); got ${paths.length}`);
+    if (input.disabled) throw new Error('this file input is disabled');
+    await l.setInputFiles(paths, { timeout: 30000 });
+    const names = await l.evaluate((el) => [...((el.tagName === 'LABEL' ? el.control : el).files || [])].map((f) => f.name)).catch(() => null);
+    return { method: 'input', ...(names ? { input_files: names } : {}) };
+  }
+  if (method === 'input') throw new Error('the element is not a file input (or a label of one); try method chooser or drop');
+  if (method !== 'drop') {
+    // Listening from before the click (which may wait for the button to become clickable) until a grace period
+    // after it: a page may open its chooser asynchronously.
+    let fc = null;
+    const onChooser = (c) => { fc ??= c; };
+    page.on('filechooser', onChooser);
+    try {
+      await l.click({ timeout: 15000 });
+      for (const end = Date.now() + (method === 'chooser' ? 10000 : 5000); !fc && Date.now() < end;) await sleep(100);
+    } finally {
+      page.off('filechooser', onChooser);
+    }
+    if (fc) {
+      if (many && !fc.isMultiple()) throw new Error(`the file chooser this opened takes one file; got ${paths.length}`);
+      await fc.setFiles(paths, { timeout: 30000 });
+      return { method: 'chooser' };
+    }
+    if (method === 'chooser') throw new Error('clicking the element opened no file chooser within 10 s');
+  }
+  // Drop: the files go into a temporary input of our own, then onto the element as a DataTransfer.
+  const tmp = await page.evaluateHandle(() => {
+    const i = document.createElement('input');
+    i.type = 'file';
+    i.multiple = true;
+    i.style.display = 'none';
+    document.documentElement.append(i);
+    return i;
+  });
+  try {
+    await tmp.setInputFiles(paths, { timeout: 30000 });
+    let accepted = null;
+    if (mainWorld) {
+      // The elements are found again by a one-off attribute; null: the page's CSP didn't run the script.
+      const key = crypto.randomBytes(8).toString('hex');
+      await tmp.evaluate((i, k) => i.setAttribute('data-bosun-src', k), key);
+      try {
+        accepted = await l.evaluate((el, [k, code]) => {
+          el.setAttribute('data-bosun-dst', k);
+          const sc = document.createElement('script');
+          sc.textContent = `(${code})(document.querySelector('[data-bosun-dst="${k}"]'), document.querySelector('[data-bosun-src="${k}"]'), true)`;
+          document.documentElement.append(sc);
+          sc.remove();
+          const r = el.getAttribute('data-bosun-res');
+          return r === null ? null : r === 'true';
+        }, [key, dropFiles.toString()], { timeout: 15000 });
+      } finally {
+        await l.evaluate((el) => { el.removeAttribute('data-bosun-dst'); el.removeAttribute('data-bosun-res'); }).catch(() => {});
+      }
+    }
+    const blocked = mainWorld && accepted === null;
+    if (accepted === null) accepted = await l.evaluate(dropFiles, tmp, { timeout: 15000 });
+    const note = blocked ? "the page's Content-Security-Policy blocked the drop script, and this engine hides files dropped from outside the page: use another engine (chromium) for this page"
+      : accepted ? 'synthetic drop (best effort): check the page took the files' : 'nothing on the page handled the drop; this element is probably not a drop zone';
+    return { method: 'drop', accepted, note };
+  } finally {
+    await tmp.evaluate((i) => i.remove()).catch(() => {});
+    await tmp.dispose().catch(() => {});
+  }
+}
 
 // The tools a token with policy "ephemeral" may call: ephemeral sessions and page tools. No profiles, keepalive,
 // meetings or handoff.
 export const EPHEMERAL_TOOLS = new Set(['session_open', 'session_close', 'navigate', 'read', 'click', 'type', 'select', 'press', 'back', 'wait_for', 'screenshot', 'sessions']);
 
-export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn = { inflight: 0 } }) {
+export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn = { inflight: 0 }, uploadBase = null }) {
   const ephemeral = policy === 'ephemeral';
-  // Fork: when this tenant has a host allowlist, say so in the tool description instead of letting the agent guess.
+  // When this tenant has a host allowlist, say so in the tool description instead of letting the agent guess.
   const allowed = manager.allowList(tenant);
-  const allowNote = allowed ? `This token may only reach: ${allowed.map((p) => (p.any ? '*' : `${p.wild ? '*.' : ''}${p.host}${p.port ? `:${p.port}` : ''}`)).join(', ')}.` : null;
-  const server = new McpServer({ name: 'bosun', version: '0.7.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const allowNote = allowed ? `This token may only reach: ${allowed.map((p) => (p.any ? '*' : `${p.wild ? '*.' : ''}${p.host.includes(':') ? `[${p.host}]` : p.host}${p.port ? `:${p.port}` : ''}`)).join(', ')}.` : null;
+  const server = new McpServer({ name: 'bosun', version: '0.10.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -139,12 +237,23 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   tool('navigate', allowNote ? `Go to a URL (http/https only). ${allowNote}` : 'Go to a URL (http/https only).', { session: str(40), url: z.string().max(4096).url(), wait: z.enum(['load', 'domcontentloaded', 'networkidle']).optional() }, async (a) => {
     const url = manager.checkAllowed(tenant, httpUrl(a.url));
     return run(a.session, async (s) => {
-      const r = await s.page.goto(url, { waitUntil: a.wait || 'domcontentloaded', timeout: 45000 });
+      const t0 = Date.now();
+      let r;
+      try {
+        r = await s.page.goto(url, { waitUntil: a.wait || 'domcontentloaded', timeout: 45000 });
+      } catch (e) {
+        // A redirect hop the tenant's proxy refused over CONNECT (https, wss) fails the navigation in the browser:
+        // say that it was the allowlist, naming host and port only.
+        const denied = /TUNNEL|PROXY/i.test(String(e?.message)) ? await manager.deniedSince(tenant, t0) : [];
+        if (denied.length) throw new Error(`navigation refused by the host allowlist of this token: ${denied[denied.length - 1]}`);
+        throw e;
+      }
       await s.page.waitForTimeout(1200);
       const w = noteWall(s, await wall(s.page));
       const info = await pageInfo(s.page);
-      // The browser follows redirects itself; one that left the allowlist got the tenant proxy's refusal instead.
-      const refused = r?.status() === 403 && !manager.isAllowed(tenant, info.url);
+      // The browser follows plain-http redirects itself; one that left the allowlist, or an allowed name that
+      // resolves into a private address, got the tenant proxy's 403 instead.
+      const refused = r?.status() === 403 && (!manager.isAllowed(tenant, info.url) || (await manager.deniedSince(tenant, t0)).length > 0);
       return ok({ status: r?.status(), ...info, ...(refused ? { refused: 'host allowlist' } : {}), ...(w ? { blocked: w, hint: 'call request_human to let a person solve it' } : {}) });
     });
   });
@@ -226,6 +335,51 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       return { content: [{ type: 'image', data: buf.toString('base64'), mimeType: 'image/jpeg' }, { type: 'text', text: file || 'not saved to disk (SAVE_SHOTS=1 enables it)' }] };
     }));
 
+  // Uploads: files of this tenant only, put into a page with upload.
+  const uploads = manager.uploads;
+  if (uploads) {
+    const maxMb = Math.round(cfg.uploadMaxBytes / 1024 / 1024);
+    tool('upload_create', `Get a file onto the browser machine for upload. Returns file_id and a one-time PUT URL (valid ${Math.round(cfg.uploadUrlTtlMs / 60000)} min, this token only): send the file with the curl line given (curl -T <file> '<put_url>'), then call upload with the file_id. Up to ${maxMb} MB. For a small file (up to 1 MB) pass content_base64 instead and use the file_id at once. Files are deleted when the session that used them closes, ${Math.round(cfg.uploadTtlMs / 60000)} min after they arrived, or on a service restart.`,
+      { filename: str(255).describe('name the page will see, e.g. "report.pdf"'), size_bytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional().describe('the exact size; the PUT must match it'),
+        content_base64: z.string().max(Math.ceil(BASE64_MAX_BYTES / 3) * 4 + 8).optional().describe('the whole file, base64 (1 MB at most): no PUT needed') },
+      async (a) => {
+        if (a.content_base64 !== undefined) {
+          const b64 = a.content_base64.replace(/\s+/g, '');
+          const content = Buffer.from(b64, 'base64');
+          // Only what decodes back to the same text: Node turns "a==" into zero bytes without a word.
+          const bare = (t) => t.replace(/=+$/, '');
+          if (!/^[A-Za-z0-9+/]*={0,2}$/.test(b64) || (b64.includes('=') && b64.length % 4) || bare(content.toString('base64')) !== bare(b64)) throw new Error('content_base64 is not base64');
+          if (content.length > BASE64_MAX_BYTES) throw new Error(`content_base64 is for files up to 1 MB; use the PUT URL (omit content_base64) for larger files`);
+          const f = await uploads.create(tenant, { filename: a.filename, content });
+          return ok({ file_id: f.id, filename: f.name, size: f.size, next: `call upload with file_id ${f.id}` });
+        }
+        if (!cfg.ws) throw new Error('the PUT URL needs the WebSocket service (WS_PORT); pass content_base64 for a small file');
+        const f = await uploads.create(tenant, { filename: a.filename, sizeBytes: a.size_bytes ?? null });
+        const where = `/upload/${f.id}?t=${f.secret}`;
+        const url = uploadBase ? `${uploadBase}${where}` : null;
+        return ok({
+          file_id: f.id, filename: f.name, put_url: url ?? where,
+          ...(url ? {} : { put_url_note: 'PUT to the host:port of your MCP URL, http, with this path' }),
+          curl: `curl -sS --fail-with-body -T ${shq(f.name)} ${shq(url ?? `http://<mcp host:port>${where}`)}`,
+          valid_min: Math.round(cfg.uploadUrlTtlMs / 60000), max_bytes: Math.min(cfg.uploadMaxBytes, a.size_bytes ?? Infinity),
+          next: 'PUT the file (one request; the URL works once), then call upload with file_id',
+        });
+      });
+    tool('upload', 'Put uploaded files (file_id, or files: several file_ids, from upload_create) into the page through an element: an <input type=file> (hidden ones too, or its label) is filled directly; a button or link that opens a file chooser is clicked and the chooser answered; anything else gets the files dropped onto it (synthetic drag-and-drop, best effort: pages that check for real user events ignore it). method forces input, chooser or drop. Several files only where the input/chooser allows multiple. Then submit the form as usual (click).',
+      { session: str(40), ...target, file_id: str(40).optional(), files: z.array(str(40)).min(1).max(20).optional(), method: z.enum(['auto', 'input', 'chooser', 'drop']).optional() },
+      async (a) => {
+        if (!hasTarget(a)) throw new Error('give the element: ref, role(+name), selector or text');
+        if (!!a.file_id === !!a.files) throw new Error('give file_id or files (not both)');
+        const ids = [...new Set(a.files ?? [a.file_id])];
+        return run(a.session, async (s) => {
+          const files = uploads.use(tenant, ids, s.id);
+          const r = await putFiles(s.page, locate(s.page, a), files.map((f) => f.file), a.method || 'auto', { mainWorld: s.engine === 'camoufox' });
+          await s.page.waitForTimeout(500);
+          return ok({ ...r, files: files.map((f) => ({ file_id: f.id, filename: f.name, size: f.size })), ...(await pageInfo(s.page)) });
+        });
+      });
+  }
+
   const waitResult = async (id, status, h) => {
     if (status === 'still_waiting') return ok({ status, expires_in_sec: Math.max(0, Math.round((h.expiresAt - Date.now()) / 1000)), next: 'call handoff_wait again' });
     const info = await run(id, async (s) => pageInfo(s.page)).catch(() => ({}));
@@ -278,17 +432,17 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const meetings = manager.meetings;
   if (meetings) {
     const mid = { meeting_id: z.string().max(20) };
-    tool('meeting_join', 'Join a Google Meet as an unauthenticated guest notetaker, or with profile (a Bosun profile signed in to Google: the account name is used) (mic and camera off), ask to be let in and wait (up to max_wait_admit_min) for admission. Once in, it posts announce_text in the chat (default: an English/German notice that audio is recorded and how to object), THEN records the meeting audio to a file. Every chat message becomes a bosun:meeting-chat event; a clear "please don\'t record" (EN/DE/UK/RU/SK) stops and deletes the recording at once (bosun:meeting-optout) and leaves (leave_on_optout=false: stay, unrecorded). Leaves by itself when the meeting ends, the bot is removed, or it is alone for 2 min; then bosun:meeting-ended carries the recording. Returns once the join request is out: poll meeting_status or wait for events. Transcription is up to you, after the meeting.',
-      { url: z.string().max(2048).url().describe('https://meet.google.com/abc-defg-hij'), name: str(60).optional().describe('display name (default "Glassy (notetaker)")'),
+    tool('meeting_join', 'Join a Google Meet or Zoom meeting as a notetaker: a Meet as an unauthenticated guest or with profile (a Bosun profile signed in to Google: the account name is used, name is ignored); a Zoom meeting (zoom.us/j/<id>?pwd=…, in Zoom\'s web client) with profile signed in to Zoom (Zoom refuses most guests). Mic and camera off; asks to be let in and waits (up to max_wait_admit_min) for admission. Once in, it posts announce_text in the chat (default: an English/German notice that audio is recorded and how to object), THEN records the meeting audio to a file. Every chat message becomes a bosun:meeting-chat event; a clear "please don\'t record" (EN/DE/UK/RU/SK) stops and deletes the recording at once (bosun:meeting-optout) and leaves (leave_on_optout=false: stay, unrecorded). Leaves by itself when the meeting ends, the bot is removed, or it is alone for 2 min; then bosun:meeting-ended carries the recording. Returns once the join request is out: poll meeting_status or wait for events. Transcription is up to you, after the meeting.',
+      { url: z.string().max(2048).url().describe('https://meet.google.com/abc-defg-hij or https://zoom.us/j/<id>?pwd=… (any *.zoom.us, /w/ and /wc/ links too)'), name: str(60).optional().describe('display name for a guest (default "Glassy (notetaker)"); a signed-in profile joins under the account name'),
         announce_text: str(1000).optional(), max_wait_admit_min: z.number().int().min(1).max(60).optional(),
-        profile: z.string().regex(TENANT_RE).optional().describe('join with an existing Bosun profile signed in to Google (gets refused less often than an anonymous guest)'),
+        profile: z.string().regex(TENANT_RE).optional().describe('join with an existing Bosun profile signed in to Google (Meet) or Zoom (gets refused far less often than an anonymous guest)'),
         engine: z.enum(cfg.engines).optional().describe('chromium (default) or patchright; camoufox is not supported for meetings'),
         leave_on_optout: z.boolean().optional() },
       async (a) => ok(await meetings.join(tenant, {
         url: a.url, name: a.name || 'Glassy (notetaker)', announceText: a.announce_text, maxWaitAdmitMin: a.max_wait_admit_min ?? 10,
         profile: a.profile, engine: a.engine, leaveOnOptOut: a.leave_on_optout ?? true,
       })));
-    tool('meeting_status', 'State of a meeting (joining, waiting, admitted, recording, ended), participants if visible, recorded seconds; without meeting_id all your meetings.',
+    tool('meeting_status', 'State of a meeting (joining, waiting, admitted, recording, ended), platform (meet, zoom), joined_as (account, guest), participants if visible, recorded seconds; without meeting_id all your meetings.',
       { meeting_id: z.string().max(20).optional() }, async (a) => ok(meetings.status(tenant, a.meeting_id)));
     tool('meeting_chat_read', 'Chat messages of a meeting seen so far (others\' messages; since = last seq you have).', { ...mid, since: z.number().int().min(0).optional() },
       async (a) => ok(meetings.chatRead(tenant, a.meeting_id, a.since ?? 0)));

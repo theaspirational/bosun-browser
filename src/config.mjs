@@ -41,15 +41,16 @@ export function loadConfig(env = process.env) {
     recordingRetentionDays: int(env, 'RECORDING_RETENTION_DAYS', 30, 1, 3650), // meeting recordings are deleted after this
     meetingOwner: (env.MEETING_OWNER || '').trim().slice(0, 60) || null, // named in the meeting announcement ("X's AI notetaker")
     tokens: parseTokens(env),
-    // Fork: features that are off unless this deployment asks for them.
-    features: { meetings: flag(env, 'FEATURES_MEETINGS', false) },
+    // Features a deployment can switch off. FEATURES_MEETINGS=0: no meeting tools, handlers or recordings directory.
+    // FEATURES_UPLOADS=0: no upload tools and no PUT endpoint.
+    features: { meetings: flag(env, 'FEATURES_MEETINGS', true), uploads: flag(env, 'FEATURES_UPLOADS', true) },
     // Chromium's own sandbox. On by default: a renderer that runs untrusted web content must not sit directly on the
     // service user. 0 is an explicit, logged choice (see README > Chromium sandbox).
     chromiumSandbox: flag(env, 'CHROMIUM_SANDBOX', true),
     // Downloads a page starts. Off by default: nothing a page fetches is written to disk.
     downloads: flag(env, 'DOWNLOADS', false),
     engines: null, // engines a session may choose
-    tenantAllow: null, // tenant -> host patterns (fork: per-tenant navigation allowlist)
+    tenantAllow: null, // tenant -> host patterns (per-tenant host allowlist, BROWSER_TENANT_ALLOW)
     policies: null,
     ws: null,
     live: null,
@@ -57,14 +58,28 @@ export function loadConfig(env = process.env) {
   if (!ENGINE_NAMES.includes(cfg.engine)) throw new Error(`ENGINE must be one of ${ENGINE_NAMES.join(', ')} (got "${cfg.engine}")`);
   try { new Intl.DateTimeFormat('en', { timeZone: cfg.tz }); } catch { throw new Error(`TZ must be an IANA time zone such as Europe/Vienna (got "${cfg.tz}")`); }
   if (cfg.camoufoxOs && !['macos', 'windows', 'linux'].includes(cfg.camoufoxOs)) throw new Error('CAMOUFOX_OS must be macos, windows or linux');
-  // Engines a session may ask for: FEATURES_ENGINES (default: chromium only), plus the configured default engine.
-  const wanted = list(env.FEATURES_ENGINES || 'chromium');
+  // Engines a session may ask for: FEATURES_ENGINES (default: all of them), plus the configured default engine.
+  const wanted = env.FEATURES_ENGINES ? list(env.FEATURES_ENGINES) : ENGINE_NAMES;
   for (const e of wanted) if (!ENGINE_NAMES.includes(e)) throw new Error(`FEATURES_ENGINES must be a comma list of ${ENGINE_NAMES.join(', ')} (got "${e}")`);
   cfg.engines = ENGINE_NAMES.filter((e) => e === cfg.engine || wanted.includes(e));
   cfg.tenantAllow = parseTenantAllow(env, cfg.tokens);
   // Disk budget for downloads (only when DOWNLOADS=1): per session, and across all sessions.
   cfg.downloadMaxMb = int(env, 'DOWNLOADS_MAX_MB', 100, 1, 1_000_000);
   cfg.downloadTotalMaxMb = int(env, 'DOWNLOADS_TOTAL_MAX_MB', Math.max(500, cfg.downloadMaxMb), cfg.downloadMaxMb, 10_000_000);
+  // File uploads into pages: the largest file, what one tenant may hold at a time, how long a file is kept and how
+  // long an upload URL stays valid. UPLOAD_BASE_URL: where tenants reach the MCP port, when the Host header they
+  // connect with is not it (TLS in front, another name).
+  cfg.uploadMaxBytes = int(env, 'UPLOAD_MAX_BYTES', 300 * 1024 * 1024, 1, 1024 ** 4);
+  cfg.uploadQuotaBytes = int(env, 'UPLOAD_TENANT_QUOTA_BYTES', Math.max(1024 ** 3, cfg.uploadMaxBytes), cfg.uploadMaxBytes, 1024 ** 5);
+  cfg.uploadTtlMs = int(env, 'UPLOAD_TTL_SEC', 3600, 10, 7 * 86400) * 1000;
+  cfg.uploadUrlTtlMs = int(env, 'UPLOAD_URL_TTL_SEC', 900, 10, 86400) * 1000;
+  cfg.uploadBaseUrl = null;
+  if (env.UPLOAD_BASE_URL) {
+    let u;
+    try { u = new URL(env.UPLOAD_BASE_URL); } catch { throw new Error('UPLOAD_BASE_URL is not a valid URL'); }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('UPLOAD_BASE_URL must be http(s)');
+    cfg.uploadBaseUrl = u.href.replace(/\/+$/, '');
+  }
   cfg.maxSessionsPerTenant = int(env, 'MAX_SESSIONS_PER_TENANT', cfg.maxSessions, 1, cfg.maxSessions);
   cfg.policies = parsePolicies(env, cfg.tokens);
   // Session cap of each tenant with policy "ephemeral".

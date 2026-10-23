@@ -4,9 +4,13 @@
 //
 //   name, matches(url), locale
 //   joinUrl(url)          the URL to load: forces Meet's English UI (hl=en)
-//   lobby(page, {name})   mic and camera off, guest name filled in (if asked), join clicked
+//   lobby(page, {name, info})  mic and camera off, guest name filled in (if asked), join clicked; info.joinedAs:
+//                         'account' | 'guest'
 //                         -> 'waiting' (knock seen) | 'asked' (no waiting room seen yet) | 'admitted' | 'denied' | 'refused' | 'ended'
+//                            (a platform may also return 'invalid' | 'sign-in' | 'captcha'; see index.mjs)
 //   state(page)           'lobby' | 'waiting' | 'admitted' | 'denied' | 'refused' | 'removed' | 'ended' | 'unknown'
+//   afterAdmit(page)      optional: what has to happen once in the call before the chat (Zoom joins computer audio)
+//   messages              optional: {refused, invalid, signIn, captcha} texts for those outcomes
 //   openChat(page), sendChat(page, text)
 //   watchChat(page, key)  install a MutationObserver that queues new chat messages; drainChat(page, key) -> [{id, sender, text}]
 //   participants(page)    number of people in the call (incl. the bot), or null if the page doesn't show it
@@ -17,8 +21,8 @@
 // Ukrainian and Russian, so a UI that comes up in another of those languages works too. Markers are labels, roles
 // and texts a person sees; a run against real Meet that fails here is fixed here.
 
-const norm = (s) => String(s || '').replace(/[‘’ʼ]/g, "'").replace(/\s+/g, ' ');
-const any = (...parts) => new RegExp(parts.join('|'), 'i');
+import { norm, any, pageText as textOutside, visible, button, firstVisible, dismissOverlays, clickThrough, ensureOff, DIALOGS, HEADINGS } from './common.mjs';
+
 const TEXT = {
   waiting: any("asking to be let in", "you'll join the call when someone lets you in", 'waiting for the host', 'please wait until a meeting host',
     'teilnahme wird (?:angefragt|erbeten)', 'sie nehmen teil, sobald', 'sobald (?:dich|sie) jemand', 'warten, bis sie jemand',
@@ -48,8 +52,19 @@ const LABEL = {
   camOff: any('^turn off camera', '^kamera (?:deaktivieren|ausschalten)', '^vypnúť kameru', '^вимкнути камеру', '^выключить камеру'),
   camOn: any('^turn on camera', '^kamera (?:aktivieren|einschalten)', '^zapnúť kameru', '^увімкнути камеру', '^включить камеру'),
   join: any('^ask to join$', '^join now$', '^join$', '^teilnahme erbitten$', '^teilnahme anfragen$', '^teilnehmen anfragen$', '^jetzt teilnehmen$', '^teilnehmen$', '^beitreten$',
-    '^požiadať o pripojenie$', '^pripojiť sa$', '^pripojiť sa teraz$', '^попросити приєднатися$', '^приєднатися$', '^приєднатися зараз$',
+    '^požiadať o pripojenie$', '^pripojiť sa$', '^pripojiť sa teraz$', '^попросити приєднатися$', '^попросити дозволу приєднатися$', '^приєднатися$', '^приєднатися зараз$',
     '^попросить разрешения присоединиться$', '^присоединиться$', '^присоединиться сейчас$'),
+  // The account is in this call on another device: "Switch here" moves it over (and drops the other device), "Join
+  // here too" (directly, or under "Other ways to join") keeps both. Bosun prefers "Join here too".
+  joinToo: any('^join here too$', '^auch hier teilnehmen$', '^hier ebenfalls teilnehmen$', '^hier auch teilnehmen$', '^pripojiť sa aj tu$', '^приєднатися й тут$', '^приєднатися і тут$', '^приєднатися також тут$', '^присоединиться и здесь$', '^присоединиться также здесь$'),
+  switchHere: any('^switch here$', '^hierher wechseln$', '^hier wechseln$', '^prepnúť sem$', '^перейти сюди$', '^переключитися сюди$', '^переключиться сюда$', '^перейти сюда$'),
+  otherWays: any('^other ways to join$', '^other joining options$', '^weitere möglichkeiten zur teilnahme$', '^weitere teilnahmeoptionen$', '^ďalšie spôsoby pripojenia$', '^інші способи приєднатися$', '^інші способи приєднання$', '^другие способы присоединиться$', '^другие способы подключения$'),
+  // Closes what Meet lays over the lobby (feature tips, "Do you want people to hear you?", "Got it"); clicked only
+  // inside a dialog.
+  dismiss: any('^got it$', '^dismiss$', '^close$', '^no thanks$', '^not now$', '^ok$', '^continue without (?:microphone|camera|microphone and camera)$',
+    '^verstanden$', '^schließen$', '^nein danke$', '^nicht jetzt$', '^ohne (?:mikrofon|kamera|mikrofon und kamera) (?:fortfahren|weiter)$',
+    '^rozumiem$', '^zavrieť$', '^nie, ďakujem$', '^зрозуміло$', '^закрити$', '^ні, дякую$', '^не зараз$', '^продовжити без (?:мікрофона|камери|мікрофона й камери|мікрофона та камери)$',
+    '^понятно$', '^закрыть$', '^нет, спасибо$', '^не сейчас$', '^продолжить без (?:микрофона|камеры|микрофона и камеры)$'),
   chat: any('^chat with everyone$', '^chat mit allen$', '^open chat$', '^chat öffnen$', '^chat$', '^chatovať so všetkými$', '^чат з усіма$', '^чат со всеми$', '^чат$'),
   chatInput: any('send a message', 'nachricht senden', 'nachricht an alle', 'odoslať správu', 'надіслати повідомлення', 'отправить сообщение'),
   leave: any('^leave call$', '^anruf verlassen$', '^leave meeting$', '^besprechung verlassen$', '^opustiť hovor$', '^вийти з дзвінка$', '^покинуть звонок$'),
@@ -57,6 +72,9 @@ const LABEL = {
 const NAME_LABELS = ['Your name', 'Ihr Name', 'Dein Name', 'Vaše meno', 'Ваше ім’я', "Ваше ім'я", 'Ваше имя'];
 // The lobby asking a guest for a name ("What's your name?" / "Wie heißen Sie?" ...).
 const NAME_PROMPT = any("what's your name", 'wie heißen sie', 'wie heißt du', 'ako sa voláte', 'як вас звати', 'как вас зовут');
+// A signed-in lobby names the account ("Switch account", or the address itself); a guest lobby offers "Sign in".
+const ACCOUNT = any('switch account', 'konto wechseln', 'prepnúť účet', 'змінити обліковий запис', 'перейти в інший обліковий запис', 'сменить аккаунт', '[\\w.+-]+@[\\w-]+(?:\\.[\\w-]+)+');
+const SIGN_IN = any('^sign in$', '^anmelden$', '^prihlásiť sa$', '^увійти$', '^войти$');
 // The guest-name field: by its label or placeholder in any of the languages; else, only while the page asks for a
 // name, the one plain text input there is (never a search box, chat box or textarea). null: no name step (signed in).
 async function nameInput(page) {
@@ -80,23 +98,21 @@ async function nameInput(page) {
 // form fields are skipped structurally, so a name or a chat line reading "The call has ended" neither ends the
 // meeting nor hides the real banner.
 const PARTICIPANT_CONTROLLED = '[data-message-id], [data-sender-name], [data-participant-id], [role="list"], [role="listitem"], textarea, input, [contenteditable="true"]';
-function pageText(page) {
-  return page.evaluate((skip) => {
-    const out = [];
-    const walk = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
-    const vis = new Map();
-    for (let n = walk.nextNode(); n && out.length < 2000; n = walk.nextNode()) {
-      const el = n.parentElement;
-      if (!el || !n.nodeValue.trim() || el.closest(skip) || /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(el.tagName)) continue;
-      if (!vis.has(el)) vis.set(el, el.checkVisibility ? el.checkVisibility() : !!el.offsetParent);
-      if (vis.get(el)) out.push(n.nodeValue.trim());
-    }
-    return out.join('\n').slice(0, 20000);
-  }, PARTICIPANT_CONTROLLED).then(norm);
+const pageText = (page, roots) => textOutside(page, PARTICIPANT_CONTROLLED, roots);
+const overlays = (page) => dismissOverlays(page, LABEL.dismiss);
+
+// Any button that joins from the lobby: "Ask to join" / "Join now", "Join here too", "Switch here".
+const joinCandidate = async (page) => await firstVisible(button(page, LABEL.join)) || await firstVisible(button(page, LABEL.joinToo)) || firstVisible(button(page, LABEL.switchHere));
+
+// The lobby kind: 'guest' (a name field), 'account' (signed in: no name field, the account shown or no "Sign in"),
+// or null (no lobby yet).
+export async function meetPrejoin(page) {
+  if (await nameInput(page)) return 'guest';
+  if (!(await joinCandidate(page))) return null;
+  if (ACCOUNT.test(await pageText(page).catch(() => ''))) return 'account';
+  const signIn = (await visible(button(page, SIGN_IN))) || (await visible(page.getByRole('link', { name: SIGN_IN })));
+  return signIn ? 'guest' : 'account';
 }
-const visible = (l) => l.first().isVisible().catch(() => false);
-const button = (page, name) => page.getByRole('button', { name });
-const disabled = (l) => l.first().evaluate((b) => b.disabled || b.getAttribute('aria-disabled') === 'true').catch(() => false);
 
 // Whether a page text is Google's "You can't join this video call" page.
 export const meetCantJoin = (text) => TEXT.cantJoin.test(norm(text));
@@ -131,47 +147,36 @@ export const meet = {
     return u.href;
   },
 
-  // Microphone or camera verified off: its control shows "turn on" (enabled or not), or Meet says that device wasn't
-  // found while no control shows it on. A control showing it on is clicked (if enabled) and checked again; a disabled
-  // one is waited out, never taken as "off". Throws if "off" can't be established: joining with a live microphone or
-  // camera is not risked.
-  async ensureOff(page, what, { onLabel, offLabel, missing }, timeoutMs = 10_000) {
-    const until = Date.now() + timeoutMs;
-    for (;;) {
-      if (await visible(button(page, offLabel))) return 'off';
-      const st = await this.state(page); // the lobby may give way to a denial, refusal or end at any time
-      if (st === 'denied' || st === 'refused' || st === 'ended') return st;
-      const on = button(page, onLabel);
-      const live = await visible(on);
-      if (!live && TEXT[missing].test(await pageText(page).catch(() => ''))) return 'no device';
-      if (live && !(await disabled(on))) await on.first().click({ timeout: 3000 }).catch(() => {});
-      if (Date.now() > until) throw new Error(`could not make sure the ${what} is off before joining (Meet changed?); not joining`);
-      await page.waitForTimeout(300);
-    }
-  },
-
-  async lobby(page, { name, timeoutMs = 30_000 }) {
+  async lobby(page, { name, info = {}, timeoutMs = 30_000 }) {
     const end = Date.now() + timeoutMs;
-    // The lobby renders in steps; wait for the join button (a guest also gets a name field first on some pages).
-    let input = null;
+    const STOP = ['denied', 'refused', 'ended'];
+    // The lobby renders in steps; wait for a join button (a guest also gets a name field first on some pages). Tips
+    // and dialogs Meet lays over it are closed on the way.
     for (;;) {
-      if (await visible(button(page, LABEL.join))) break;
+      if (await joinCandidate(page)) break;
       const s = await this.state(page);
-      if (s === 'denied' || s === 'refused' || s === 'ended') return s;
-      if (Date.now() > end) throw new Error(`no "Ask to join" button found on the Meet page (not a Meet lobby, or Meet changed); page ${s}`);
+      if (STOP.includes(s)) return s;
+      if (Date.now() > end) throw new Error(`no "Ask to join" / "Join now" button found on the Meet page (not a Meet lobby, or Meet changed); page ${s}`);
+      await overlays(page);
       await page.waitForTimeout(500);
     }
-    for (const [what, onLabel, offLabel, missing] of [['microphone', LABEL.micOff, LABEL.micOn, 'noMic'], ['camera', LABEL.camOff, LABEL.camOn, 'noCamera']]) {
-      const r = await this.ensureOff(page, what, { onLabel, offLabel, missing });
-      if (r === 'denied' || r === 'refused' || r === 'ended') return r;
+    await overlays(page);
+    for (const [what, onLabel, offLabel, missing] of [['microphone', LABEL.micOff, LABEL.micOn, TEXT.noMic], ['camera', LABEL.camOff, LABEL.camOn, TEXT.noCamera]]) {
+      const r = await ensureOff(page, { what, onLabel, offLabel, missing, text: pageText, state: (p) => this.state(p), stop: STOP, site: 'Meet' });
+      if (STOP.includes(r)) return r;
     }
-    // Signed in to Google: no name field, Meet uses the account's name.
-    input = await nameInput(page);
-    if (input) await input.fill(name, { timeout: 5000 });
-    const join = button(page, LABEL.join).first();
-    // Guests may have to type a name before the button is enabled.
-    for (let i = 0; i < 20 && await disabled(join); i++) await page.waitForTimeout(250);
-    await join.click({ timeout: 10_000 });
+    // Signed in to Google: no name field, Meet uses the account's name (`name` is not used).
+    info.joinedAs = await meetPrejoin(page) || 'account';
+    if (info.joinedAs === 'guest') {
+      const input = await nameInput(page);
+      if (input) await input.fill(name, { timeout: 5000 });
+    }
+    const join = await this.joinButton(page);
+    if (!join) throw new Error('the Meet lobby has no join button any more (Meet changed?)');
+    // Guests may have to type a name before the button is enabled, and a signed-in lobby says "Getting ready..." for a
+    // while; a tip or dialog over the button is closed.
+    await clickThrough(page, join.button, { what: `"${join.label}" on the Meet page`, overlays });
+    info.joinedVia = join.label;
     for (let i = 0; i < 10; i++) {
       await page.waitForTimeout(500);
       const s = await this.state(page);
@@ -180,16 +185,40 @@ export const meet = {
     return 'asked'; // the request went out, but no waiting room was seen (yet)
   },
 
-  async state(page) {
-    const t = await pageText(page).catch(() => '');
+  // The button that joins: "Ask to join" / "Join now"; with the account already in the call elsewhere, "Join here
+  // too" (also behind "Other ways to join"), else "Switch here". -> {button, label} | null
+  async joinButton(page) {
+    const pick = async (re) => { const b = await firstVisible(button(page, re)); return b ? { button: b, label: (await b.innerText().catch(() => '')).trim() || String(re) } : null; };
+    const primary = await pick(LABEL.join);
+    if (primary) return primary;
+    const too = await pick(LABEL.joinToo);
+    if (too) return too;
+    const other = await firstVisible(button(page, LABEL.otherWays));
+    if (other) {
+      await other.click({ timeout: 3000 }).catch(() => {});
+      for (let i = 0; i < 6; i++) {
+        await page.waitForTimeout(250);
+        const t = (await firstVisible(page.getByRole('menuitem', { name: LABEL.joinToo })) || await firstVisible(button(page, LABEL.joinToo)));
+        if (t) return { button: t, label: (await t.innerText().catch(() => '')).trim() || 'Join here too' };
+      }
+      await page.keyboard.press('Escape').catch(() => {});
+    }
+    return pick(LABEL.switchHere);
+  },
+
+  // admitted: the manager knows Bosun got in. From then on only Meet's dialogs (and, with the call's controls gone,
+  // headings: Meet's end page) can say the call ended or Bosun was removed; captions and the meeting title are
+  // participants' words. Before that the whole page counts (lobby, refusal, waiting).
+  async state(page, { admitted = false } = {}) {
+    const inCall = await firstVisible(page.locator('[data-participant-id]')) || await visible(button(page, LABEL.chat));
+    const t = await pageText(page, inCall ? DIALOGS : admitted ? `${DIALOGS}, ${HEADINGS}` : null).catch(() => '');
     if (TEXT.denied.test(t)) return 'denied';
     if (TEXT.cantJoin.test(t)) return 'refused';
     if (TEXT.removed.test(t)) return 'removed';
     if (TEXT.ended.test(t)) return 'ended';
+    if (inCall || admitted) return 'admitted';
     if (TEXT.waiting.test(t)) return 'waiting';
-    // In the call: participant tiles or the in-call chat button (the lobby has neither).
-    if (await page.locator('[data-participant-id]').count().catch(() => 0) || await visible(button(page, LABEL.chat))) return 'admitted';
-    if (await visible(button(page, LABEL.join))) return 'lobby';
+    if (await joinCandidate(page)) return 'lobby';
     return 'unknown';
   },
 

@@ -44,7 +44,7 @@ export const MANIFEST = {
           [MEETING_TAGS.optout]: { desc: 'someone asked not to be recorded; the recording was stopped and deleted' },
           [MEETING_TAGS.ended]: { desc: 'Bosun left the meeting; origin carries duration and the recording (if any)' },
         },
-        keyed: { 'bosun:meeting': { open: true }, 'bosun:platform': { values: ['meet'] } },
+        keyed: { 'bosun:meeting': { open: true }, 'bosun:platform': { values: ['meet', 'zoom'] } },
       },
     },
   },

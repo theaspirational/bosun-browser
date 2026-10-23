@@ -10,7 +10,7 @@ them.
 
 Threat model behind these choices: the browser runs untrusted web content, so it keeps **Chromium's own sandbox**
 (§3a — this needs host configuration, and the service refuses to start without it), and the user it runs as must
-own nothing else and reach nothing else. See [FORK-SECURITY-REVIEW.md](FORK-SECURITY-REVIEW.md) — in particular H1
+own nothing else and reach nothing else. See [SECURITY-REVIEW-0.7.0.md](SECURITY-REVIEW-0.7.0.md) — in particular H1
 (where the browser may go), H3 (the sandbox), M1 (the live-view link is a bearer token), M4 (child processes inherit
 the service's environment, tokens included) and M5 (downloads on disk).
 
@@ -23,7 +23,7 @@ sudo install -d -o root  -g bosun -m 0750 /etc/bosun
 
 sudo apt-get install -y nodejs npm xvfb   # Node 20+; use nodesource if the distro ships an older one
 sudo install -d -o root -g root -m 0755 /opt/bosun
-sudo git clone <this fork> /opt/bosun     # or unpack a release tarball
+sudo git clone https://github.com/The-Glassy/bosun-browser /opt/bosun   # or unpack a release tarball
 sudo chown -R root:root /opt/bosun        # code is read-only to the service user
 ```
 
@@ -32,7 +32,7 @@ root's cache:
 
 ```sh
 cd /opt/bosun
-sudo npm ci --omit=optional               # skips patchright/camoufox; this fork only enables chromium
+sudo npm ci --omit=optional               # skips patchright/camoufox (then set FEATURES_ENGINES=chromium, §5)
 sudo -u bosun env HOME=/var/lib/bosun PLAYWRIGHT_BROWSERS_PATH=/var/lib/bosun/pw-browsers \
   npx playwright install chromium
 sudo npx playwright install-deps chromium # the shared libraries Chromium needs (root, once)
@@ -152,6 +152,9 @@ Both listeners bind `127.0.0.1`. Nothing is published by Bosun itself.
   clients use the `bosun-mcp-stdio` bridge (README › stdio bridge). If a remote agent needs it, publish it on the
   private network with its own path and keep the token requirement:
   `tailscale serve --bg --https=443 --set-path=/mcp http://127.0.0.1:7360`.
+  The same port takes the one-time upload PUTs (README › Uploading files). Bosun builds their URL from the `Host`
+  the MCP client connected with, as `http://`; behind TLS or a path like the one above, set
+  `UPLOAD_BASE_URL=https://<node>.ts.net/mcp`.
 - **Live view** is published for the human's phone:
 
 ```sh
@@ -174,6 +177,7 @@ host), without a trailing path.
 
 ```sh
 BROWSER_TENANT_ALLOW=ops=*.example.org,example.org,127.0.0.1:4848; swarm=*.example.org
+# Only if you don't use them (both default to on):
 FEATURES_MEETINGS=0
 FEATURES_ENGINES=chromium
 ```
@@ -198,19 +202,23 @@ FEATURES_ENGINES=chromium
   CAPTCHA vendor. A handoff can only reach what the tenant may reach.
 - A tenant that is not named is unrestricted and gets no proxy at all.
 - This is a per-tenant rule inside the service, not a replacement for the egress policy in §4.
-- `FEATURES_MEETINGS=0` (the default here) means the meeting tools are not listed and their handlers are not wired:
+- `FEATURES_MEETINGS=0` (the default is `1`) means the meeting tools are not listed and their handlers are not wired:
   no recordings directory, no PulseAudio server, no `ffmpeg`. Turning it on adds a recording consent surface — read
   README › Meetings first.
-- `FEATURES_ENGINES=chromium` (the default here) means a session cannot ask for the anti-detect engines. Enable
-  them deliberately (`FEATURES_ENGINES=chromium,patchright`) and install them first. `patchright` runs Bosun's
+- `FEATURES_ENGINES=chromium` (the default is all three) means a session cannot ask for the anti-detect engines.
+  Set it whenever `npm ci --omit=optional` left them out, or list exactly the ones you installed. `patchright` runs Bosun's
   masking helpers in an isolated world, which stops a page from switching masking off — but not from copying what
   the human typed somewhere masking does not look (review finding H2). No engine makes an untrusted page safe to
   type a credential into.
-- `DOWNLOADS=0` (the default here) means the browser context refuses downloads, so a page cannot write files at
+- `DOWNLOADS=0` (the default) means the browser context refuses downloads, so a page cannot write files at
   all. With `DOWNLOADS=1`, `DOWNLOADS_MAX_MB` (per session) and `DOWNLOADS_TOTAL_MAX_MB` (service-wide) bound what
   is kept; one download may still use its own size transiently before it is measured, and Playwright keeps download
   files under `/tmp` — which is RAM-backed on most systems and, with `PrivateTmp=yes`, private to this unit. Give
   the volume a quota, or keep downloads off.
+- Uploads (`FEATURES_UPLOADS=1`, the default) land in `BROWSER_DATA/uploads`, on the data volume and not in `/tmp`,
+  so they never count against `MemoryMax`. `UPLOAD_MAX_BYTES` (300 MB per file) and `UPLOAD_TENANT_QUOTA_BYTES`
+  (1 GB per tenant) bound them; files go when their session closes, after an hour, and at every start. Size the
+  volume for the quota times the tenants that upload, or set `FEATURES_UPLOADS=0`.
 
 ## 6. Operating it
 
@@ -237,8 +245,8 @@ FEATURES_ENGINES=chromium
 - [ ] `LIVE_BASE_URL` matches the `tailscale serve` address; a link opens on a phone in the tailnet.
 - [ ] Every tenant that should be restricted appears in `BROWSER_TENANT_ALLOW`; a `navigate` to another host is
       refused, and the refusal shows up in the journal without the query.
-- [ ] `FEATURES_MEETINGS=0`, `FEATURES_ENGINES` lists only what is installed, `DOWNLOADS=0` (or a quota on the
-      volume).
+- [ ] `FEATURES_MEETINGS` matches whether meetings are used, `FEATURES_ENGINES` lists only what is installed,
+      `DOWNLOADS=0` (or a quota on the volume), `FEATURES_UPLOADS` and the upload quota fit the volume.
 - [ ] The service started without a `CHROMIUM_SANDBOX=0` warning, and no renderer process shows `--no-sandbox`.
 - [ ] Egress to private ranges is blocked for the service.
 - [ ] `ALLOW_NO_TOKEN` is unset.

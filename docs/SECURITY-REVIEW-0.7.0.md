@@ -1,7 +1,8 @@
-# Security review of Bosun 0.7.0 (upstream `e0504b2`)
+# Security review of Bosun 0.7.0 (`e0504b2`)
 
-Reviewed 2026-10-22 against upstream commit `e0504b2` ("read-only tokens for subagents"), as the basis for this
-fork. Line references are to that commit; `file:line` points at the code the finding is about.
+Reviewed 2026-10-22 against commit `e0504b2` ("read-only tokens for subagents", release 0.7.0); contributed with the
+hardening that became 0.8.0 (pull request #9). Line references are to that commit; `file:line` points at the code
+the finding is about. The status column says what 0.8.0 does about each finding.
 
 **Scope.** Authentication and tenant isolation, the live-view handoff link, masking of credential fields around a
 handoff, URL handling on `navigate`, WebSocket origin checks, resource caps, dependency pinning, anything that runs
@@ -9,21 +10,21 @@ page-controlled code where Bosun or the agent can be affected by it, and any cal
 
 **Method.** Read of `src/**`, `bin/**`, `package.json` / `package-lock.json` and the docs; `grep` for outbound
 network use; live probes against headless Chromium (below, under H2, H3 and M5). Two further independent review
-rounds then attacked this fork's own changes, and between them corrected three of the conclusions below and two of
+rounds then attacked the proposed changes, and between them corrected three of the conclusions below and two of
 the mechanisms: the first version of the host allowlist let ordinary HTTP redirects and WebSockets straight past,
 the second broke the browser's origin isolation while fixing that, Chromium had been running with `--no-sandbox`
 all along, and engine choice is a much weaker credential boundary than H2 first claimed. All of it is corrected
 here (H1 — including what the two failed mechanisms were — H2 and H3), and the enforcement now sits at the network
 layer, where it does not have to re-implement anything the browser already does. Not done: fuzzing,
 a review of the Playwright/Chromium/`ws`/`zod` dependencies themselves, no test against a real hostile site, no
-review of `src/meetings/**` beyond the parts that touch the service's security properties (meetings are off in this
-fork).
+review of `src/meetings/**` beyond the parts that touch the service's security properties.
 
-**Verdict.** Nothing found that makes the service unsafe to run for our use (UI checks and human-finished logins on
-hosts we control) **provided** three things hold: the service cannot reach anything it has no business reaching
-(network egress policy plus the per-tenant host allowlist this fork adds), a handoff where the human types real
-credentials happens on a page we trust — on any engine (H2) — and the browser keeps its own sandbox (H3). None of
-the HIGH findings is a code defect in the service's own logic: upstream states the egress requirement in
+**Verdict.** Nothing found that makes the service unsafe to run for the reviewer's use (UI checks and human-finished
+logins on hosts the operator controls) **provided** three things hold: the service cannot reach anything it has no
+business reaching (network egress policy plus the per-tenant host allowlist added in 0.8.0), a handoff where the
+human types real credentials happens on a page the operator trusts — on any engine (H2) — and the browser keeps its
+own sandbox (H3). None of the HIGH findings is a code defect in the service's own logic: 0.7.0 states the egress
+requirement in
 `README.md` › Security notes but ships no in-process control for it, leaves Playwright's default `--no-sandbox` in
 place, and documents the page-world limitation in `docs/ENGINES.md:101-105` without spelling out that it is
 defeatable.
@@ -32,20 +33,20 @@ Severity: **HIGH** = can expose credentials or reach systems outside the intende
 an important guarantee or depends entirely on the deployment to be safe. **LOW** = hardening, bounded impact.
 **INFO** = verified, no action.
 
-| # | Severity | Finding | Status in this fork |
+| # | Severity | Finding | Status in 0.8.0 |
 |---|---|---|---|
 | H1 | HIGH | `navigate` and page requests may go to any host (SSRF; cloud metadata, private LAN) | mitigated: per-tenant host allowlist (`BROWSER_TENANT_ALLOW`) enforced by a per-tenant forward proxy — every connection, including redirect hops, worker WebSockets and DNS |
 | H2 | HIGH | A page can defeat credential masking and the post-handoff clearing on engine `chromium` | documented; engine choice stops only the helper tampering — the page must be trusted either way |
 | H3 | HIGH | Chromium runs with `--no-sandbox`: a renderer compromise lands on the service user | fixed: `chromiumSandbox: true`, `CHROMIUM_SANDBOX=0` to opt out loudly, startup preflight |
 | M1 | MEDIUM | The live-view link is a bearer token for the whole handoff, retakeable after 5 s of viewer silence | accepted: live view on loopback behind a private-network proxy |
 | M2 | MEDIUM | Masking covers the page dump, not the URL and title returned with it | documented |
-| M3 | MEDIUM | One shared Chromium browser process serves every tenant; the global session cap is shared | narrowed: a tenant with an allowlist gets its own browser process; the rest still share one, caps still global |
+| M3 | MEDIUM | One shared Chromium browser process serves every tenant; the global session cap is shared | narrowed: each session of a tenant with an allowlist gets its own browser process; the rest still share one, caps still global |
 | M4 | MEDIUM | Service secrets are inherited by every browser child process | deploy guidance: own user, own `EnvironmentFile` |
 | M5 | MEDIUM | A page's downloads are written to disk with no budget at all | fixed: `DOWNLOADS=0` by default, per-session and service-wide byte budgets |
 | L1 | LOW | Legacy `?token=` query parameter still accepted | deploy guidance: header only |
 | L2 | LOW | No rate limiting, lockout or log on failed authentication | accepted |
 | L3 | LOW | `ALLOW_NO_TOKEN=1` gives any local process a full-policy tenant | deploy guidance: never set |
-| L4 | LOW | The per-meeting PulseAudio socket is `auth-anonymous=1` | meetings off by default in this fork |
+| L4 | LOW | The per-meeting PulseAudio socket is `auth-anonymous=1` | `FEATURES_MEETINGS=0` turns meetings off where they are not used |
 | L5 | LOW | Page and meeting text reaches the agent unsanitized (prompt injection) | inherent; agent side must treat it as data |
 | L6 | LOW | An agent-supplied regex is compiled and run inside the page | accepted |
 | I1 | INFO | No telemetry and no call home | verified |
@@ -69,15 +70,15 @@ sits in. There is no DNS-rebinding protection either; only the scheme is validat
 Impact: read access to link-local metadata services and internal HTTP endpoints from the service's network
 position, exfiltration of what it reads via a following request.
 
-Upstream's position (`README.md:412-414`) is that the deployment must block private ranges on egress; the
+0.7.0's position (`README.md:412-414`) is that the deployment must block private ranges on egress; the
 `http(s)`-only check explicitly does not replace that boundary.
 
-**In this fork:** `BROWSER_TENANT_ALLOW` gives a tenant a host allowlist, and the tenant's browser reaches the
-network **only through a forward proxy the service runs for that tenant** (`src/proxy.mjs`). That tenant also gets
-a **browser instance of its own**, launched with that proxy (`--proxy-bypass-list=<-loopback>`, QUIC off, WebRTC's
+**In 0.8.0:** `BROWSER_TENANT_ALLOW` gives a tenant a host allowlist, and the tenant's browser reaches the
+network **only through a forward proxy the service runs for that tenant** (`src/proxy.mjs`). Each of that tenant's
+sessions also gets a **browser instance of its own**, launched with that proxy (`--proxy-bypass-list=<-loopback>`, QUIC off, WebRTC's
 non-proxied UDP off, and Chromium does not fall back to a direct connection when a proxy refuses). Those are
 browser-wide flags, so they stay in that browser: tenants without an allowlist share a browser launched the way
-upstream launches it, and configuring one tenant's allowlist does not change another tenant's transports
+0.7.0 launches it, and configuring one tenant's allowlist does not change another tenant's transports
 (`test/transport-isolation.test.mjs`). Every connection the browser wants arrives there
 as a request or a `CONNECT` and is checked before a byte leaves the host: navigations, **each hop of a redirect**,
 subresources, XHR, WebSockets from a page **and from a worker**, service-worker fetches, prefetches. The proxy
@@ -85,7 +86,7 @@ resolves DNS itself, once, and connects to that address, so the address the deci
 that is used; a name that resolves into loopback or a private range is only followed if the allowlist names that
 address too (DNS rebinding). Denials are answered with `403` and logged as `host:port` and a reason — never a path
 or a query. `navigate` and `keepalive_set` check the list up front as well, so the agent gets a clear refusal. A
-tenant with no allowlist gets no proxy and keeps upstream behaviour. The proxy listens on loopback with a random
+tenant with no allowlist gets no proxy and keeps 0.7.0's behaviour. The proxy listens on loopback with a random
 password of its own, so another local process cannot use it as an open proxy into the tenant's hosts.
 
 Nothing is intercepted: TLS is tunnelled, plain HTTP is streamed, no response is terminated, rewritten or
@@ -122,7 +123,7 @@ What the proxy costs, and what it still does not do:
   tunnel to any port on that host; prefer `host:port`. Paths and queries are never examined (nor logged).
 - Plain `http://` is proxied as HTTP/1.1 (no h2c, no QUIC); `https://` is end-to-end inside the tunnel.
 - Hosts that are allowed can still talk to each other under the browser's normal rules. Reachability is not trust.
-- The proxy is per tenant inside one service; network egress policy remains the outer boundary, as upstream says.
+- The proxy is per tenant inside one service; network egress policy remains the outer boundary, as the README says.
 
 ## H2 — HIGH: on engine `chromium`, the page can defeat credential masking and the post-handoff clearing
 
@@ -155,11 +156,11 @@ name does not.
 
 `docs/ENGINES.md:101-105` and `README.md` › Handoff state that the helpers run in the page's world on plain
 Chromium and that a page can *detect* them; that they can be neutralized is not stated. `patchright` and `camoufox`
-run the scans in an isolated world (upstream's own test asserts this and skips it for `chromium`:
+run the scans in an isolated world (the existing test asserts this and skips it for `chromium`:
 `test/handoff.test.mjs:326`).
 
 **How far another engine helps — corrected.** An earlier version of this review recommended `ENGINE=patchright`
-for credentials on sites "we do not control". That is too strong a promise, and the second review round showed
+for credentials on sites "the operator does not control". That is too strong a promise, and the second review round showed
 why. An isolated world only stops a page from *replacing Bosun's own objects*; it shares the page's DOM, and
 masking works on fields — their current value, and the values Bosun has seen in them. A page that simply moves what
 the human typed somewhere else defeats masking on every engine, with no tampering at all:
@@ -172,19 +173,19 @@ MIRROR READ  … submit | Mirror-probe-secret …    # the MCP read returns it a
 
 That is reproduced as a standing test (`test/masking-limits.test.mjs`), together with the case that *is* masked, so
 the two documents and the behaviour cannot drift apart. Screenshots have the same shape: the mask covers the
-inputs, not a copy of their contents elsewhere on the page. Upstream says as much for the page's own doing
-(`README.md` › Handoff: "secrets the page itself echoes as normal text" are not protected); the mistake was ours,
-in presenting an engine switch as a boundary.
+inputs, not a copy of their contents elsewhere on the page. The README says as much for the page's own doing
+(`README.md` › Handoff: "secrets the page itself echoes as normal text" are not protected); the mistake was the
+first review round's, in presenting an engine switch as a boundary.
 
-**In this fork:** the helper-tampering hole is not fixed in code — fixing it upstream-compatibly means moving the
-scans off the page world for `chromium` too, which is upstream's design decision, not ours. What holds instead:
+**In 0.8.0:** the helper-tampering hole is not fixed in code — fixing it means moving the
+scans off the page world for `chromium` too, a design change left for later. What holds instead:
 `ENGINE=patchright` stops that one technique (an isolated world), the host allowlist (H1) keeps a handoff on hosts
-the tenant may reach at all, and **the page where a human types a credential has to be one we trust, whatever the
+the tenant may reach at all, and **the page where a human types a credential has to be a trusted one, whatever the
 engine**. If that is not true for some flow, the credential does not belong in this browser.
 
 ## H3 — HIGH: Chromium runs without its own sandbox
 
-Neither Chromium launch path passes `chromiumSandbox` (`src/engines.mjs:49-55` upstream), and the pinned Playwright
+Neither Chromium launch path passes `chromiumSandbox` (`src/engines.mjs:49-55` in 0.7.0), and the pinned Playwright
 adds `--no-sandbox` unless that option is explicitly `true`. Probed on a real session of the service: both the
 browser process and the renderer carried `--no-sandbox`.
 
@@ -199,9 +200,9 @@ one renderer bug, and the attacker is reading `profiles/<tenant>/…` (every ten
 service's environment (M4) and whatever else that user can reach. The systemd hardening in a deployment is a
 different boundary — it limits what the *user* may do, not what a compromised renderer may do inside it — and the
 first version of this review discussed "escaping the browser sandbox" without noticing there was none. That was a
-review defect; the launch behaviour itself is upstream's.
+review defect; the launch behaviour itself is 0.7.0's.
 
-**In this fork:** both Chromium-family engines launch with `chromiumSandbox: true` (`src/engines.mjs`), which is
+**In 0.8.0:** both Chromium-family engines launch with `chromiumSandbox: true` (`src/engines.mjs`), which is
 also what `CHROMIUM_SANDBOX` defaults to. Because the sandbox needs host configuration, startup runs a preflight on
 Linux — it starts the browser the way sessions will and closes it again — and **refuses to start** with the three
 things an operator can do about it (unprivileged user namespaces, an AppArmor profile that grants `userns`, or the
@@ -212,7 +213,7 @@ sandbox on, the service either runs sandboxed or refuses to start" — it assert
 renderer when the sandbox works, and the instructive refusal when it cannot).
 
 Note for this repository's CI and for containers: unprivileged user namespaces are often unavailable there (on the
-machine this fork was built on, `kernel.apparmor_restrict_unprivileged_userns=1` and Playwright's `chrome_sandbox`
+machine these changes were built on, `kernel.apparmor_restrict_unprivileged_userns=1` and Playwright's `chrome_sandbox`
 is not setuid), which is exactly when the service now refuses to start. The test suite sets `CHROMIUM_SANDBOX=0`
 deliberately and says so.
 
@@ -231,7 +232,7 @@ Give up, timeout, cancel, `session_close` and agent disconnect all revoke the li
 404 and `/ws/` is rejected; the last frame is dropped (`:521`), and the handoff only resolves once the human's input
 has drained (`:530-537`), with `drainFailed` closing the session if it cannot (`src/sessions.mjs:282`).
 
-Documented upstream (`README.md:415-419`). Accepted for this fork: the live view listens on loopback and is reached
+Documented in the README (`README.md:415-419`). Accepted for the reviewer's deployment: the live view listens on loopback and is reached
 only over a private network (see `docs/DEPLOY-SYSTEMD.md`), `HANDOFF_TTL_SEC` stays at the default, and the human
 presses Done when finished.
 
@@ -240,7 +241,7 @@ presses Done when finished.
 `read` masks the snapshot and only then prepends the URL and title (`src/tools.mjs:164-166`); `navigate`, `click`,
 `type`, `press`, `back`, `wait_for` and `sessions` return `pageInfo` / `page.url()` unmasked
 (`src/tools.mjs:143,173,180,191,196,203,300`). A credential that reaches the query string (a form that submits with
-GET) or the page title is therefore visible to the agent even while the field itself is masked. Upstream treats the
+GET) or the page title is therefore visible to the agent even while the field itself is masked. 0.7.0 treats the
 title after Done as intentional (`test/handoff.test.mjs:49`), and navigation history is deliberately stored without
 the query (`src/sessions.mjs:16`), so this is a known boundary rather than an oversight — but it is worth knowing
 before pointing a handoff at a login form that uses GET.
@@ -253,12 +254,12 @@ browser-process level, or any Chromium bug that crosses contexts, crosses tenant
 `MAX_SESSIONS_PER_TENANT` defaults to it (`src/config.mjs:42`), so one tenant can occupy every slot and starve the
 others (keepalive leaves one slot free for agents, `src/keepalive.mjs:346-349`, but an agent does not).
 
-Upstream says hard isolation means one process and data dir per tenant (`README.md:410-411`). Accepted for one
+The README says hard isolation means one process and data dir per tenant (`README.md:410-411`). Accepted for one
 team; set `MAX_SESSIONS_PER_TENANT` below `MAX_SESSIONS` when more than one tenant shares a service.
 
-**In this fork, partly narrowed as a side effect of H1:** a tenant with a host allowlist runs in a browser process
-of its own (it has to, because the flags that keep it inside its proxy are browser-wide), so such a tenant no
-longer shares a process with anyone. Tenants without an allowlist still share one browser, and the session caps are
+**In 0.8.0, partly narrowed as a side effect of H1:** each session of a tenant with a host allowlist runs in a
+browser process of its own (it has to, because the flags and profile preferences that keep it inside its proxy are
+browser-wide), so such a tenant no longer shares a process with anyone. Tenants without an allowlist still share one browser, and the session caps are
 still global.
 
 ## M4 — MEDIUM: service secrets are inherited by every child process
@@ -274,7 +275,7 @@ with containment; one service process per tenant is what contains it.
 
 ## M5 — MEDIUM: a page's downloads are written to disk with no budget
 
-Playwright contexts accept downloads unless told otherwise, and upstream never says otherwise: no
+Playwright contexts accept downloads unless told otherwise, and 0.7.0 never says otherwise: no
 `acceptDownloads`, no cancellation, no byte or count cap. Probed by the second review round on a real session — a
 click on an attachment link saved 65 536 bytes without anyone asking — and the resource-cap inventory in the first
 version of this review missed it entirely (I4 listed screenshots, DOM size and meeting recordings, not downloads).
@@ -283,7 +284,7 @@ A page can therefore write as much as it likes, as often as it likes, for as lon
 `MAX_SESSIONS`, `MemoryMax` and `PrivateTmp` do not bound disk: files land in Playwright's artifacts directory
 (under `/tmp`, which is commonly a tmpfs, so it is RAM) and live until the context closes.
 
-**In this fork:** downloads are off by default (`DOWNLOADS=0` → `acceptDownloads: false`, so a download is refused
+**In 0.8.0:** downloads are off by default (`DOWNLOADS=0` → `acceptDownloads: false`, so a download is refused
 by the context and nothing is written). With `DOWNLOADS=1`, each session keeps at most `DOWNLOADS_MAX_MB` (default
 100) and the service at most `DOWNLOADS_TOTAL_MAX_MB` (default 500) of downloaded bytes: a download that would pass
 either budget is cancelled before it is written, or deleted again if its size was only known afterwards, and the
@@ -294,7 +295,7 @@ size on disk before it can be measured — so give the volume a real quota if yo
 ## L1 — LOW: the legacy `?token=` query parameter is still accepted
 
 `tokenFromRequest` falls back to the query parameter (`src/auth.mjs:26-30`, used at `src/wsserver.mjs:76`), which
-puts the token into URLs, proxy logs and anything that keeps request lines. Documented and deprecated upstream
+puts the token into URLs, proxy logs and anything that keeps request lines. Documented and deprecated in the README
 (`README.md:60-62`); use the `Authorization: Bearer` header only.
 
 ## L2 — LOW: no rate limiting, lockout or logging on failed authentication
@@ -302,7 +303,7 @@ puts the token into URLs, proxy logs and anything that keeps request lines. Docu
 The upgrade handler answers 401 and destroys the socket (`src/wsserver.mjs:69-83`); nothing counts failures, delays
 retries or logs them, so there is no audit trail of a token being probed. `MAX_CONNECTIONS` (32) and TCP setup cost
 are the only brake. With 16+-character tokens (`src/auth.mjs:5`) guessing is not the risk; the missing log is.
-Upstream acknowledges the gap (`README.md:420`).
+The README acknowledges the gap (`README.md:420`).
 
 ## L3 — LOW: `ALLOW_NO_TOKEN=1`
 
@@ -314,7 +315,7 @@ a shared host.
 
 `module-native-protocol-unix … auth-anonymous=1` (`src/meetings/audio.mjs:43`) on a socket inside a `0700` temp
 directory: the directory is the only protection, so any process of the same user can play into or record from a
-meeting's audio server. Meetings are disabled by default in this fork (`FEATURES_MEETINGS=0`).
+meeting's audio server. A deployment that does not use meetings can switch them off (`FEATURES_MEETINGS=0`): no audio server at all.
 
 ## L5 — LOW: page and meeting content reaches the agent unsanitized
 
@@ -342,7 +343,7 @@ fetched at install time from Microsoft's and Camoufox's CDNs.
 ## I2 — INFO: token handling and tenant namespacing are sound
 
 - Every configured token is compared as a fixed-length SHA-256 digest with `crypto.timingSafeEqual`, with no
-  short-circuit on match (`src/auth.mjs:11-23`); upstream's test asserts the call count and digest length
+  short-circuit on match (`src/auth.mjs:11-23`); the existing test asserts the call count and digest length
   (`test/config.test.mjs:49-64`).
 - Startup refuses tokens under 16 characters, bad tenant names and two tenants sharing a token
   (`src/auth.mjs:46-52`), and refuses to listen on a non-loopback address without a token (`src/config.mjs:56-58`).
@@ -392,7 +393,7 @@ these six packages have to be watched.
 
 ## I6 — INFO: nothing runs agent- or page-supplied code in the service process
 
-There is no `evaluate` tool (upstream's design lists it as opt-in and has not built it, `docs/DESIGN.md:52,133`).
+There is no `evaluate` tool (the design lists it as opt-in and has not built it, `docs/DESIGN.md:52,133`).
 What an agent can supply is a URL, a CSS selector / role / text target (`src/tools.mjs:71-78`), a keepalive check and
 a watch regex (L6) — all of it goes to Playwright or into the page, never to `eval` in the service. Bosun's own
 injected helpers are the exception that H2 is about. `procsUsing` shells out via `execFileSync` with a fixed argv and
@@ -401,7 +402,7 @@ own directory.
 
 ---
 
-## What this fork changed in response
+## What 0.8.0 changed in response
 
 1. **H1** — `BROWSER_TENANT_ALLOW=<tenant>=<host>,<host>;…`: a per-tenant host allowlist, enforced by a forward
    proxy the service runs for that tenant and launches its browser contexts with, so it is the browser's only way
@@ -414,13 +415,20 @@ own directory.
    off.
 3. **M5** — `DOWNLOADS=0` by default; with downloads on, `DOWNLOADS_MAX_MB` per session and
    `DOWNLOADS_TOTAL_MAX_MB` across the service, enforced by cancelling or deleting what goes past them.
-4. **L4 / consent surface** — `FEATURES_MEETINGS=0` by default: the meeting tools are not listed and their handlers
-   are not wired; no recordings directory, no audio server, no PulseAudio socket.
-5. **anti-detect surface** — `FEATURES_ENGINES=chromium` by default: a session can only pick `chromium` (plus
-   whatever `ENGINE` is set to), so `patchright` and `camoufox` have to be enabled deliberately.
+4. **L4 / consent surface** — `FEATURES_MEETINGS=0` switches meetings off (on by default): the meeting tools are not
+   listed and their handlers are not wired; no recordings directory, no audio server, no PulseAudio socket.
+5. **anti-detect surface** — `FEATURES_ENGINES` (default: all three) limits which engines a session may pick, plus
+   whatever `ENGINE` is set to.
 6. **M1 / M4 / L1 / L3** — `docs/DEPLOY-SYSTEMD.md`: own unprivileged user, Xvfb, `TasksMax`, both listeners on
    loopback, live view published over a private network only, secrets in a root-owned `EnvironmentFile` outside the
    repository, bearer header only, `ALLOW_NO_TOKEN` never set, and what the Chromium sandbox needs from the host.
+7. **Follow-ups found while merging** — camoufox kept loopback outside the proxy (Firefox never proxies localhost
+   unless `network.proxy.allow_hijacking_localhost` is set), so a proxied Firefox now gets that preference, WebRTC
+   through the proxy only, no HTTP/3 and no DNS prefetching. A persistent Chromium profile (profiles, `patchright`,
+   meetings) ignores `--force-webrtc-ip-handling-policy`, so the profile also gets the `webrtc.ip_handling_policy`
+   preference before a proxied launch — and so does full Chromium in general (headful), whose shared browser had no
+   profile to carry it: each session of a proxied tenant now runs in a browser of its own on a temporary profile.
+   The allowlist suites run on all three engines, and headful under Xvfb.
 
 Residual risk after those changes, in order:
 
@@ -431,9 +439,9 @@ Residual risk after those changes, in order:
   allowed can talk to each other under the browser's normal rules — reachability is not mutual trust. Network
   egress policy stays the outer boundary.
 - Plain `http://` is proxied as HTTP/1.1, so no h2c and no QUIC for proxied tenants; `https://` is end-to-end.
-  Every connection of a proxied tenant passes through one extra local hop, and each proxied tenant runs a browser
-  process of its own (that is what keeps its transport flags out of everybody else's browser, and it costs the RAM
-  of one more browser per such tenant).
+  Every connection of a proxied tenant passes through one extra local hop, and each session of a proxied tenant
+  runs a browser process of its own (that is what keeps its transport flags and profile preferences out of
+  everybody else's browser, and it costs the RAM of one browser per such session).
 - **M1** for as long as a handoff link is live; **M2** on a login form that submits with GET; **M3** while several
   tenants share one process (and one browser); **M5**'s transient single-download size if downloads are enabled.
 - **H3** on a host where the operator chooses `CHROMIUM_SANDBOX=0`: then M4's inherited tokens and every tenant's

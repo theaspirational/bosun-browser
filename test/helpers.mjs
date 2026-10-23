@@ -77,11 +77,10 @@ export function tmpDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'bosun-t
 export async function startBosun(env = {}, opts = {}) {
   const dataDir = tmpDir();
   const cfg = loadConfig({
-    HEADLESS: '1', BROWSER_DATA: dataDir, WS_PORT: '0', LIVE_PORT: '0', BROWSER_TOKENS: `alice:${TOKEN},bob:${TOKEN_B}`,
+    // TEST_HEADFUL=1 (under Xvfb on Linux) runs the full browser instead of Chromium's headless shell, as a headful
+    // deployment does: some browser behaviour (WebRTC policy) differs between the two.
+    HEADLESS: process.env.TEST_HEADFUL === '1' ? '0' : '1', BROWSER_DATA: dataDir, WS_PORT: '0', LIVE_PORT: '0', BROWSER_TOKENS: `alice:${TOKEN},bob:${TOKEN_B}`,
     MAX_SESSIONS: '4',
-    // The suites below exercise the upstream feature surface; this fork's defaults (meetings off, chromium only)
-    // are asserted in features.test.mjs, which passes them explicitly.
-    FEATURES_MEETINGS: '1', FEATURES_ENGINES: 'chromium,patchright,camoufox',
     // Chromium's sandbox needs host configuration (user namespaces or the setuid helper, see
     // docs/DEPLOY-SYSTEMD.md) that a CI container usually does not have; features.test.mjs asserts that the
     // default (sandbox on) either works or refuses to start.

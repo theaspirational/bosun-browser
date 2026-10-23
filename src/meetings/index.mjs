@@ -1,4 +1,4 @@
-// Meetings (PoC): Bosun joins a video meeting as an unauthenticated guest notetaker, says so in the chat, records the
+// Meetings (PoC): Bosun joins a video meeting as a notetaker (a guest, or with a signed-in profile), says so in the chat, records the
 // meeting's audio to a file and leaves again. Transcription is not done here; it happens after the meeting, from the
 // recording. Consent: everyone in the chat is told before recording starts, every chat message reaches the agent as
 // an event, and a clear request not to be recorded (any of five languages, see optout.mjs) stops the recording and
@@ -6,7 +6,7 @@
 //
 // A meeting runs in a session of its own (owner meeting:<id>, so it outlives the agent's connection), in a browser
 // process of its own whose audio goes to a private PulseAudio server (audio.mjs). Platforms (platforms/*.mjs) hold
-// everything site-specific; Google Meet is the only one so far.
+// everything site-specific: Google Meet (meet.mjs) and Zoom's web client (zoom.mjs).
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -16,10 +16,11 @@ import { readProfileMeta } from '../engines.mjs';
 import { TENANT_RE } from '../auth.mjs';
 import { matchOptOut } from './optout.mjs';
 import { meet } from './platforms/meet.mjs';
+import { zoom } from './platforms/zoom.mjs';
 import { pulseAudio } from './audio.mjs';
 
 export const ID_RE = /^m[0-9a-f]{12}$/;
-export const PLATFORMS = [meet];
+export const PLATFORMS = [meet, zoom];
 const POLL_MS = 1000;
 const ALONE_MS = 120_000; // alone in the call this long: leave
 const JOIN_REPLY_MS = 60_000; // meeting_join answers once the join request is out (or after this)
@@ -55,6 +56,20 @@ export const CONFIRM_DELETED = 'Recording stopped and deleted. / Aufnahme gestop
 export const REFUSED_BY_GOOGLE = "Google refused to let this guest join (\"You can't join this video call\") before anyone could admit it. " +
   'Google often does this for automated guests, especially from datacenter IPs. Join with a Bosun profile that is signed in to a ' +
   'Google account (meeting_join with profile), or run Bosun from a residential IP.';
+
+// How a join that didn't get in ends: lobby/state outcome -> [reason, error]. Platforms may word the error.
+function outcome(m, s) {
+  const say = m.platform.messages || {};
+  switch (s) {
+    case 'denied': return ['denied', 'the request to join was denied'];
+    case 'refused': return [m.platform.refusedReason || 'refused_by_google', say.refused || REFUSED_BY_GOOGLE];
+    case 'ended': return ['meeting-ended', 'the meeting has ended'];
+    case 'invalid': return ['invalid-meeting', m.info.error || say.invalid || 'the meeting link is not valid'];
+    case 'sign-in': return ['sign-in-required', say.signIn || 'only signed-in users can join this meeting; join with a signed-in profile'];
+    case 'captcha': return ['captcha', say.captcha || 'the meeting page asked for a captcha before joining'];
+    default: return null;
+  }
+}
 
 const sleep = (ms, signal) => new Promise((r) => {
   if (signal?.aborted) return r();
@@ -120,8 +135,8 @@ export class Meetings {
     if (this.stopped || this.manager.closing) throw new Error('service is shutting down');
     url = httpUrl(url);
     const platform = this.platformFor(url);
-    if (!platform) throw new Error('only Google Meet links (https://meet.google.com/abc-defg-hij) are supported for now');
-    // A signed-in profile: an existing Bosun profile (logged in to Google with session_open + request_human first),
+    if (!platform) throw new Error('only Google Meet (https://meet.google.com/abc-defg-hij) and Zoom (https://zoom.us/j/<id>?pwd=…) links are supported for now');
+    // A signed-in profile: an existing Bosun profile (logged in to Google or Zoom with session_open + request_human first),
     // opened with the engine it was last used with unless one is given.
     let meta = null;
     if (profile) {
@@ -148,7 +163,7 @@ export class Meetings {
       announce: announceText ? [announceText] : announcement(name, this.cfg.meetingOwner),
       maxWaitMs: maxWaitAdmitMin * 60_000, state: 'joining', reason: null, error: null,
       createdAt: this.now(), admittedAt: null, endedAt: null, rig: null, session: null, rec: null, stopping: null, recMs: 0, file: null, deleted: false,
-      noRecord: false, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], sentAll: new Set(), participants: null, aloneSince: null, optedOut: null, chatKey: `__b${crypto.randomBytes(8).toString('hex')}`,
+      info: {}, noRecord: false, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], sentAll: new Set(), participants: null, aloneSince: null, optedOut: null, chatKey: `__b${crypto.randomBytes(8).toString('hex')}`,
       ac: new AbortController(), joined: deferred(), finishing: null,
     };
     this.active.set(id, m);
@@ -176,14 +191,17 @@ export class Meetings {
     }).catch(async (e) => { await rig.close().catch(() => {}); throw e; });
     m.session = session;
     if (m.finishing) { await this.manager.dispose(session, 'meeting-ended').catch(() => {}); await rig.close().catch(() => {}); return; }
-    await m.session.ctx.grantPermissions(['microphone', 'camera'], { origin: new URL(m.url).origin }).catch(() => {});
-    await this.page(m, (p) => p.goto(platform.joinUrl ? platform.joinUrl(m.url) : m.url, { waitUntil: 'domcontentloaded', timeout: 45_000 })).catch((e) => {
+    const target = platform.joinUrl ? platform.joinUrl(m.url) : m.url;
+    for (const origin of new Set([new URL(m.url).origin, new URL(target).origin, ...(platform.origins ? platform.origins(m.url) : [])])) {
+      await m.session.ctx.grantPermissions(['microphone', 'camera'], { origin }).catch(() => {});
+    }
+    if (platform.prepare) await platform.prepare(m.session.ctx);
+    await this.page(m, (p) => p.goto(target, { waitUntil: 'domcontentloaded', timeout: 45_000 })).catch((e) => {
       throw new Error(`could not load the meeting page: ${String(e?.message || e).split('\n')[0].slice(0, 200)}`);
     });
-    const first = await this.page(m, (p) => platform.lobby(p, { name: m.name }));
-    if (first === 'denied') return this.finish(m, 'denied', 'the request to join was denied');
-    if (first === 'refused') return this.finish(m, 'refused_by_google', REFUSED_BY_GOOGLE);
-    if (first === 'ended') return this.finish(m, 'meeting-ended', 'the meeting has ended');
+    const first = await this.page(m, (p) => platform.lobby(p, { name: m.name, info: m.info, profile: m.profile, url: m.url }));
+    if (outcome(m, first)) return this.finish(m, ...outcome(m, first));
+    if (first === 'removed') return this.finish(m, 'denied', 'the request to join was denied');
     if (first === 'waiting' || first === 'asked') {
       m.knocked = first === 'waiting'; // the waiting room was seen: the request reached the meeting
       transition(m, 'waiting');
@@ -192,13 +210,13 @@ export class Meetings {
       for (;;) {
         await sleep(this.pollMs, signal);
         if (signal.aborted || m.state === 'ended') return;
-        const s = await this.page(m, (p) => platform.state(p));
+        const s = await this.page(m, (p) => platform.state(p, { admitted: false }));
         if (s === 'admitted') break;
         if (s === 'waiting') m.knocked = true;
-        if (s === 'denied') return this.finish(m, 'denied', 'the request to join was denied');
         // "Can't join" after the waiting room: the request was turned down. Without one: Google turned the guest away.
-        if (s === 'refused') return m.knocked ? this.finish(m, 'denied', 'the request to join was denied') : this.finish(m, 'refused_by_google', REFUSED_BY_GOOGLE);
-        if (s === 'ended' || s === 'removed') return this.finish(m, 'meeting-ended', 'the meeting has ended');
+        // Removed from the waiting room (Zoom): turned down too.
+        if (s === 'denied' || s === 'removed' || (s === 'refused' && m.knocked)) return this.finish(m, 'denied', 'the request to join was denied');
+        if (outcome(m, s)) return this.finish(m, ...outcome(m, s));
         if (this.now() > until) return this.finish(m, 'not-admitted', `not admitted within ${Math.round(m.maxWaitMs / 60_000)} min`);
       }
     }
@@ -207,6 +225,7 @@ export class Meetings {
     m.joined.resolve();
     // Consent first: the chat hears about the recording before it starts.
     await this.page(m, async (p) => {
+      if (platform.afterAdmit) await platform.afterAdmit(p); // Zoom: computer audio joined, mic and camera off
       m.participants = await platform.participants(p);
       await platform.openChat(p);
       await platform.watchChat(p, m.chatKey);
@@ -237,9 +256,13 @@ export class Meetings {
   }
 
   async tick(m) {
-    const s = await this.page(m, (p) => m.platform.state(p));
-    if (s === 'ended') return this.finish(m, 'meeting-ended');
-    if (s === 'removed') return this.finish(m, 'removed');
+    const s = await this.page(m, (p) => m.platform.state(p, { admitted: true }));
+    if (s === 'ended' || s === 'removed') {
+      // An objection already in the chat counts before the recording is kept: the page usually still holds it.
+      await this.pollChat(m).catch(() => {});
+      if (m.state === 'ended') return;
+      return this.finish(m, s === 'ended' ? 'meeting-ended' : 'removed');
+    }
     await this.pollChat(m);
     if (m.state === 'ended') return;
     const n = await this.page(m, (p) => m.platform.participants(p));
@@ -255,14 +278,14 @@ export class Meetings {
     m.sentAll.add(text.trim());
     m.pendingOwn.push(text.trim());
     if (m.pendingOwn.length > 50) m.pendingOwn.shift();
-    await m.platform.sendChat(page, text);
+    await m.platform.sendChat(page, text, { selfName: m.info.selfName || m.name });
   }
 
   // Ours only if we just sent exactly this text AND the chat shows it as from us; each sent message matches once.
   // A participant named "You" or after the bot, or repeating something the bot said, is not taken for the bot.
   own(m, msg) {
     const sender = (msg.sender || '').trim(), text = (msg.text || '').trim();
-    if (!(SELF_SENDERS.test(sender) || sender === m.name)) return false;
+    if (!(SELF_SENDERS.test(sender) || sender === m.name || (m.info.selfName && sender === m.info.selfName))) return false;
     const i = m.pendingOwn.indexOf(text);
     if (i < 0) return false;
     m.pendingOwn.splice(i, 1);
@@ -362,7 +385,7 @@ export class Meetings {
     const recMs = m.recMs + (m.rec ? this.now() - m.rec.startedAt : 0);
     const bytes = m.file ? fs.statSync(m.file, { throwIfNoEntry: false })?.size ?? 0 : null;
     return {
-      meeting_id: m.id, platform: m.platform.name, url: m.url, state: m.state,
+      meeting_id: m.id, platform: m.platform.name, url: m.url, state: m.state, ...(m.info.joinedAs ? { joined_as: m.info.joinedAs } : {}),
       ...(m.reason ? { reason: m.reason } : {}), ...(m.error ? { error: m.error } : {}),
       participants: m.participants, recording_seconds: Math.round(recMs / 1000),
       recording: m.file ? { path: m.file, bytes } : m.deleted ? 'deleted' : null,

@@ -1,6 +1,7 @@
 // The real audio pipeline (Linux with PulseAudio, ffmpeg and a display, e.g. under xvfb-run; skipped elsewhere): a
 // meeting page playing a 440 Hz tone ends up as a non-empty Ogg/Opus file (16 kHz mono, ~24 kbps, mode 0600), and a
-// silent meeting recorded at the same time stays silent (each session has its own audio server).
+// silent meeting recorded at the same time stays silent (each session has its own audio server); a Zoom meeting is
+// recorded the same way once computer audio is joined.
 //   docker build -f docker/meeting-test.Dockerfile -t bosun-meeting-test docker
 //   docker run --rm -v "$PWD":/app -w /app bosun-meeting-test xvfb-run -a node --test test/meeting-audio.test.mjs
 import { test, before, after } from 'node:test';
@@ -62,5 +63,36 @@ test('a meeting playing a tone is recorded to Ogg/Opus 16 kHz mono; a silent one
     await c.close();
   } finally {
     await svc.stop();
+  }
+});
+
+test('Zoom: the meeting is heard once computer audio is joined, and recorded the same way', { skip: why || false }, async () => {
+  const { startFakeZoom } = await import('./fakezoom.mjs');
+  const { zoom, zoomWebClientUrl } = await import('../src/meetings/platforms/zoom.mjs');
+  const z = await startFakeZoom({ tone: true });
+  const platform = { ...zoom, joinUrl: (u) => zoomWebClientUrl(u).replace('https://app.zoom.us', z.base), origins: () => [z.base] };
+  const svc = await startBosun({ KEEPALIVE: '0', HEADLESS: '0', ENGINE: 'chromium' }, { meetings: { platformFor: (u) => (zoom.matches(u) ? platform : null), pollMs: 300 } });
+  const ended = [];
+  svc.events.on('meeting-ended', (e) => ended.push(e));
+  try {
+    const c = await connect(svc);
+    const s = await c.open({ profile: 'zoom', engine: 'chromium' });
+    await c.call('session_close', { session: s });
+    const { url } = z.newRoom({ signedIn: true, open: true });
+    const res = await c.call('meeting_join', { url, profile: 'zoom' });
+    assert.equal(res.isError, false, res.text);
+    const id = res.json().meeting_id;
+    await until(async () => (await c.call('meeting_status', { meeting_id: id })).json().state === 'recording', 30_000);
+    await sleep(5000);
+    await c.call('meeting_leave', { meeting_id: id });
+    await until(() => ended.length === 1, 15_000);
+    const r = ended[0].recording;
+    assert.ok(r.bytes > 1000, `bytes ${r.bytes}`);
+    assert.equal(probe(r.path).streams[0].codec_name, 'opus');
+    assert.ok(meanDb(r.path) > -30, `tone recording too quiet: ${meanDb(r.path)} dB`);
+    await c.close();
+  } finally {
+    await svc.stop();
+    await z.close();
   }
 });

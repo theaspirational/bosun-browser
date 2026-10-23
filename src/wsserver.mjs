@@ -1,12 +1,13 @@
 // MCP over WebSocket: authenticate in the HTTP upgrade (before any WebSocket or MCP server exists), one MCP server
-// per connection, the connection is the owner of the sessions it opens (closed again when it disconnects).
+// per connection, the connection is the owner of the sessions it opens (closed again when it disconnects). The same
+// port takes the one-time upload PUTs (uploads.mjs), so a tenant reaches them wherever it reaches MCP.
 import http from 'http';
 import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createAuthenticator, policyOf, tokenFromRequest } from './auth.mjs';
 import { buildServer } from './tools.mjs';
 
-const MAX_PAYLOAD = 1024 * 1024;
+const MAX_PAYLOAD = 2 * 1024 * 1024; // a 1 MiB file as base64 (upload_create content_base64) fits
 const HEARTBEAT_MS = 30_000;
 const MAX_OPEN_REQUESTS = 64; // requests (of any method) received and not yet answered
 const MAX_BUFFERED = 8 * 1024 * 1024; // bytes queued to a client that doesn't read
@@ -60,7 +61,24 @@ export async function startWsServer({ cfg, manager }) {
   const conns = new Set();
   let seq = 0;
 
-  const srv = http.createServer((_req, res) => { res.writeHead(426, { 'content-type': 'text/plain' }); res.end('WebSocket only'); });
+  const uploads = manager.uploads;
+  const authTenant = (req) => {
+    if (!req.headers.authorization) return null;
+    return (allowNoToken ? 'default' : auth(tokenFromRequest(req, new URLSearchParams()))) || false;
+  };
+  const srv = http.createServer(async (req, res) => {
+    try {
+      if (uploads && await uploads.handle(req, res, { authTenant, policyOf: (t) => policyOf(cfg, t) })) return;
+    } catch {
+      return res.destroy();
+    }
+    res.writeHead(426, { 'content-type': 'text/plain' });
+    res.end('WebSocket only');
+  });
+  // An upload may take longer than Node's 5-minute request limit; uploads.mjs bounds each PUT itself (idle, total).
+  srv.requestTimeout = 0;
+  // Expect: 100-continue is answered by uploads.mjs once the size and credentials are checked, not by Node at once.
+  srv.on('checkContinue', (req, res) => srv.emit('request', req, res));
   srv.on('clientError', (_e, sock) => sock.destroy());
   srv.on('error', (e) => console.error(`bosun ws: ${e.message}`));
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD });
@@ -76,13 +94,21 @@ export async function startWsServer({ cfg, manager }) {
       const tenant = allowNoToken ? 'default' : auth(tokenFromRequest(req, query));
       if (!tenant) return reject(sock, 401, 'Unauthorized');
       if (conns.size >= maxConnections) return reject(sock, 503, 'Service Unavailable');
-      wss.handleUpgrade(req, sock, head, (ws) => onConnection(ws, tenant));
+      wss.handleUpgrade(req, sock, head, (ws) => onConnection(ws, tenant, uploadBase(req)));
     } catch {
       reject(sock, 400, 'Bad Request');
     }
   });
 
-  function onConnection(ws, tenant) {
+  // Where this client reaches the port: UPLOAD_BASE_URL, else the Host it connected with (a tenant behind a proxy
+  // device knows the port by its own address). Only ever shown to that same client.
+  const uploadBase = (req) => {
+    if (cfg.uploadBaseUrl) return cfg.uploadBaseUrl;
+    const h = String(req.headers.host || '');
+    return /^(?:[A-Za-z0-9.-]{1,253}|\[[0-9A-Fa-f:.]{2,45}\])(?::\d{1,5})?$/.test(h) ? `http://${h}` : null;
+  };
+
+  function onConnection(ws, tenant, base) {
     ws.on('error', () => {});
     conns.add(ws);
     const owner = `c${++seq}-${crypto.randomBytes(4).toString('hex')}`;
@@ -90,7 +116,7 @@ export async function startWsServer({ cfg, manager }) {
     ws.on('pong', () => { alive = true; });
     const hb = setInterval(() => { if (!alive) return ws.terminate(); alive = false; try { ws.ping(); } catch {} }, HEARTBEAT_MS);
     hb.unref();
-    const server = buildServer({ manager, owner, tenant, cfg, policy: policyOf(cfg, tenant), conn: { inflight: 0 } });
+    const server = buildServer({ manager, owner, tenant, cfg, policy: policyOf(cfg, tenant), conn: { inflight: 0 }, uploadBase: base });
     ws.on('close', () => {
       clearInterval(hb);
       conns.delete(ws);

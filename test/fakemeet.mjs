@@ -24,9 +24,19 @@ const esc = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 // 'nodevices': no buttons, Meet says no camera/microphone found | 'disabledOn': the mic shows "turn off" but is
 // disabled | 'staleBanner': "Microphone not found" while a stuck mic control still shows it on), signedIn (no name
 // field, "Join now"), bareName (a name field without label or placeholder, under "What's your name?"), searchBox (an
-// unrelated text box in the lobby), bigChallenge (the refusal page shows a visible challenge frame).
-function app({ lang = 'en', toggles = 'ok', signedIn = false, bareName = false, searchBox = false, bigChallenge = false }) {
+// unrelated text box in the lobby), bigChallenge (the refusal page shows a visible challenge frame). Signed in, as seen
+// on real Meet: account (the account's address and "Switch account" shown), dialog (a modal "Do you want people to
+// hear you in the meeting?" over the lobby, so a click on the join button is intercepted until it is closed),
+// readyMs (the join button is disabled, "Getting ready...", that long), elsewhere (the account is in the call on
+// another device: "Switch here", and "Join here too" under "Other ways to join").
+function app({ title = '', lang = 'en', toggles = 'ok', signedIn = false, bareName = false, searchBox = false, bigChallenge = false, account = false, dialog = false, readyMs = 0, elsewhere = false }) {
   const L = UI[lang];
+  const de = lang === 'de';
+  const joinButtons = elsewhere
+    ? `<button id="switch">${de ? 'Hierher wechseln' : 'Switch here'}</button><button id="other" aria-haspopup="menu">${de ? 'Weitere Möglichkeiten zur Teilnahme' : 'Other ways to join'}</button>
+       <div role="menu" id="menu" hidden><div role="menuitem" id="too" tabindex="0">${de ? 'Auch hier teilnehmen' : 'Join here too'}</div><div role="menuitem" tabindex="0">${de ? 'Präsentieren' : 'Present'}</div></div>`
+    : `<button id="ask"${readyMs ? ' disabled' : ''}><span>${esc(signedIn ? L.joinNow : L.ask)}</span></button>
+       <button id="other">${de ? 'Weitere Möglichkeiten zur Teilnahme' : 'Other ways to join'}</button>`;
   const frame = bigChallenge ? '<iframe src="/recaptcha/api2/anchor?k=x" title="reCAPTCHA" width="300" height="300"></iframe>' : '<iframe src="/recaptcha/api2/anchor?k=x" title="reCAPTCHA" width="10" height="10"></iframe>';
   const nameField = signedIn ? '' : bareName ? '<input type="text">' : `<input type="text" placeholder="${esc(L.name)}"${lang === 'en' ? ` aria-label="${esc(L.name)}"` : ''}>`;
   return `<!doctype html><meta charset="utf-8"><title>Meet</title>
@@ -35,13 +45,17 @@ function app({ lang = 'en', toggles = 'ok', signedIn = false, bareName = false, 
   <button id="mic" aria-label="${esc(L.micOff)}"${toggles === 'disabledOn' ? ' disabled' : ''}>mic</button><button id="cam" aria-label="${esc(L.camOff)}">cam</button>
   ${toggles === 'nodevices' ? `<p>${esc(L.noCam)}</p><p>${esc(L.noMic)}</p>` : toggles === 'staleBanner' ? `<p>${esc(L.noMic)}</p>` : ''}
   ${searchBox ? '<input type="text" id="search" aria-label="Search">' : ''}
-  ${nameField}<button id="ask"><span>${esc(signedIn ? L.joinNow : L.ask)}</span></button>
-  <button id="other">${lang === 'de' ? 'Weitere Möglichkeiten zur Teilnahme' : 'Other ways to join'}</button></div>
+  ${nameField}${joinButtons}
+  ${readyMs ? `<p id="ready">${de ? 'Wird vorbereitet…' : 'Getting ready...'}</p>` : ''}
+  ${account ? '<div id="acct"><span>glassy@smartie.team</span> <a href="#">Switch account</a></div>' : signedIn ? '' : '<a href="#" id="signin">Sign in</a>'}</div>
+${dialog ? `<div id="dlg" role="dialog" aria-modal="true" style="position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:10"><div style="background:#fff;margin:80px auto;width:360px;padding:16px">
+  <h2>${de ? 'Möchten Sie, dass andere Sie in der Besprechung hören?' : 'Do you want people to hear you in the meeting?'}</h2>
+  <button id="dlgOk">${de ? 'Ohne Mikrofon und Kamera fortfahren' : 'Continue without microphone and camera'}</button></div></div>` : ''}
 <div id="waiting" hidden><p>${esc(L.waiting)}</p></div>
 <div id="denied" hidden><h1>${esc(L.cantJoin)}</h1><p>${esc(L.denied)}</p></div>
 <div id="refused" hidden><h1>${esc(L.cantJoin)}</h1><button>${esc(L.home)}</button><p>${esc(L.safe)}</p>${frame}</div>
 <div id="pending" hidden></div>
-<div id="call" hidden><div id="tiles"></div>
+<div id="call" hidden><div id="topic">${esc(title || '')}</div><div id="tiles"></div><div id="captions" class="caption-text"></div>
   <div role="toolbar"><button aria-label="${esc(L.chat)}">chat</button><button aria-label="${esc(L.leave)}">leave</button></div>
   <aside id="panel" hidden><div role="list" id="msgs"></div><textarea aria-label="${esc(L.send)}"></textarea></aside></div>
 <div id="over" hidden><h1 id="overText"></h1></div>
@@ -55,7 +69,11 @@ $('cam').onclick = () => { cam = !cam; $('cam').setAttribute('aria-label', cam ?
 if (TOGGLES === 'none' || TOGGLES === 'nodevices') { $('mic').hidden = $('cam').hidden = true; }
 if (TOGGLES === 'nodevices') { mic = cam = false; }
 if (TOGGLES === 'stuck' || TOGGLES === 'staleBanner') $('mic').onclick = null;
-$('ask').onclick = () => { const f = document.querySelector('#lobby input:not(#search)'), q = $('search'); post('ask', { name: f ? f.value : null, mic, cam, ...(q ? { search: q.value } : {}) }); };
+const ask = (via) => () => { const f = document.querySelector('#lobby input:not(#search)'), q = $('search'); post('ask', { name: f ? f.value : null, mic, cam, via, ...(q ? { search: q.value } : {}) }); };
+if ($('ask')) $('ask').onclick = ask('ask');
+if ($('switch')) { $('switch').onclick = ask('switch'); $('too').onclick = ask('too'); $('other').onclick = () => { $('menu').hidden = !$('menu').hidden; }; }
+if ($('dlgOk')) $('dlgOk').onclick = () => $('dlg').remove();
+if (${readyMs}) setTimeout(() => { $('ask').disabled = false; $('ready')?.remove(); }, ${readyMs});
 document.querySelector('[aria-label="' + L.chat + '"]').onclick = () => { $('panel').hidden = false; };
 document.querySelector('[aria-label="' + L.leave + '"]').onclick = () => post('leave', {});
 const box = document.querySelector('textarea');
@@ -65,6 +83,7 @@ async function poll() {
   for (const id of ['lobby', 'waiting', 'denied', 'refused', 'pending', 'call', 'over']) $(id).hidden = s.view !== id;
   if (s.view === 'over') $('overText').textContent = L[s.over];
   if (s.view === 'call') {
+    $('captions').textContent = s.caption || '';
     const want = s.participants.join();
     if ($('tiles').dataset.p !== want) {
       $('tiles').dataset.p = want;
@@ -110,13 +129,14 @@ export async function startFakeMeet({ tone = false } = {}) {
       if (r.phase === 'pending' && Date.now() >= r.refuseAt) r.phase = 'refused';
       const view = r.over ? 'over' : ['waiting', 'denied', 'refused', 'pending'].includes(r.phase) ? r.phase : r.phase === 'admitted' ? 'call' : 'lobby';
       const chat = r.chat.map((m) => (m.fillAt && Date.now() < m.fillAt ? { ...m, text: '' } : m));
-      return json({ view, over: r.over, participants: ['self', ...r.others], chat, tone: r.tone });
+      return json({ view, over: r.over, participants: ['self', ...r.others], chat, tone: r.tone, caption: r.caption || null });
     }
     if (req.method === 'POST') {
       const b = await body(req);
       const r = room(b.code);
       if (u.pathname === '/api/ask') {
         r.guest = { name: b.name, mic: b.mic, cam: b.cam, ...('search' in b ? { search: b.search } : {}) };
+        r.via = b.via;
         // refuseAfterMs: a blank page first (no waiting room), then Google's refusal.
         r.phase = r.refuse ? (r.refuseAfterMs ? 'pending' : 'refused') : r.open ? 'admitted' : 'waiting';
         if (r.refuseAfterMs) r.refuseAt = Date.now() + r.refuseAfterMs;
@@ -143,6 +163,7 @@ export async function startFakeMeet({ tone = false } = {}) {
     toggles: (c, mode) => { room(c).toggles = mode; },
     setOthers: (c, others) => { room(c).others = others; },
     end: (c) => { room(c).over = 'ended'; },
+    caption: (c, text) => { room(c).caption = text; },
     remove: (c) => { room(c).over = 'removed'; },
     // Variants of a room (set before the page loads): lang, toggles, signedIn, bareName; refuse = Google turns the
     // guest away right after "Ask to join".

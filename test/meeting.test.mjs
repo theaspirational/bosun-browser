@@ -225,7 +225,7 @@ test("denied, can't join, not admitted in time: clear errors and an ended event 
 test('refused: links that are not Google Meet, camoufox, no audio support, headless with real audio', async () => {
   await withService(async (svc) => {
     const c = await connect(svc);
-    assert.match((await c.call('meeting_join', { url: 'https://zoom.example.com/j/123' })).text, /only Google Meet links/);
+    assert.match((await c.call('meeting_join', { url: 'https://zoom.example.com/j/123' })).text, /only Google Meet \(.*\) and Zoom \(https:\/\/zoom.us\/j\/<id>\?pwd=…\) links are supported/);
     assert.match((await c.call('meeting_join', { url: 'file:///etc/passwd' })).text, /http|url/i);
     assert.match((await c.call('meeting_join', { url: fake.newRoom().url, engine: 'camoufox' })).text, /meetings need a Chromium engine/);
     assert.equal(svc.manager.used, 0);

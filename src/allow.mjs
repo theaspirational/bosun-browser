@@ -1,4 +1,4 @@
-// Per-tenant navigation host allowlist (fork addition): which hosts a tenant may reach. The patterns are matched
+// Per-tenant host allowlist (BROWSER_TENANT_ALLOW): which hosts a tenant may reach. The patterns are matched
 // here; they are enforced in src/proxy.mjs, the per-tenant forward proxy that is the only way out of that tenant's
 // browser (so every navigation, redirect hop, subresource, WebSocket and worker request is checked), and, for a
 // clearer error before anything is opened, on `navigate` and `keepalive_set`. A tenant without an allowlist is
@@ -33,9 +33,14 @@ export function parseHostPattern(raw) {
   }
   host = host.replace(/\.$/, '');
   const wild = host.startsWith('*.');
-  const bare = wild ? host.slice(2) : host;
+  let bare = wild ? host.slice(2) : host;
   if (!bare || bare.includes('*') || /[^a-z0-9.:_-]/.test(bare)) throw new Error(`host pattern "${raw}" must be a host, *.host, host:port or "*"`);
   if (port !== null && (port < 1 || port > 65535)) throw new Error(`host pattern "${raw}" has a port outside 1-65535`);
+  // The form a URL gives the same host (what allowsUrl compares against): ::1 for 0:0:0:0:0:0:0:1, ::ffff:7f00:1 for
+  // ::ffff:127.0.0.1, 127.0.0.1 for 127.1.
+  try { bare = new URL(`http://${bare.includes(':') ? `[${bare}]` : bare}/`).hostname.replace(/^\[|\]$/g, ''); } catch {
+    throw new Error(`host pattern "${raw}" is not a valid host`);
+  }
   return { any: false, host: bare, wild, port };
 }
 

@@ -1,11 +1,13 @@
-// Fork: what a page may write to disk. Downloads are refused unless DOWNLOADS=1; with downloads on, a session keeps
+// What a page may write to disk. Downloads are refused unless DOWNLOADS=1; with downloads on, a session keeps
 // at most DOWNLOADS_MAX_MB and the service DOWNLOADS_TOTAL_MAX_MB, so a page cannot fill the volume. Built from the
 // review's probe (an attachment link that saved 65 kB unasked), driven through the real MCP tools.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'fs';
 import http from 'http';
+import path from 'path';
 import { loadConfig } from '../src/config.mjs';
-import { startBosun, connect, until, TOKEN } from './helpers.mjs';
+import { startBosun, connect, until, tmpDir, TOKEN } from './helpers.mjs';
 
 const MB = 1024 * 1024;
 
@@ -39,6 +41,15 @@ const budgetLogs = () => logs.filter((l) => l.includes('(download budget)'));
 
 // Clicks a download link through the MCP tools and returns the Download object. Not awaiting failure() here: a
 // download the budget deleted has no artifact left to ask.
+// A refused download is either cancelled while it runs or, if it was quicker than that (Firefox), deleted: either way
+// nothing of it stays on disk.
+async function refusedAndGone(d) {
+  const failure = String(await d.failure().catch((e) => e.message)); // a deleted artifact cannot be asked any more
+  let kept = false;
+  try { const p = await d.path(); kept = !!p && fs.existsSync(p); } catch {}
+  return /canceled|cancelled/.test(failure) || !kept;
+}
+
 async function grab(svc, c, id, selector) {
   const page = svc.manager.sessions.get(id).page;
   const wait = page.waitForEvent('download', { timeout: 15000 }).catch(() => null);
@@ -110,7 +121,7 @@ test('a session that used up its budget has the next download refused before it 
     const next = await grab(svc, c, id, '#small');
     await until(() => budgetLogs()[0], 10000);
     assert.equal(budgetLogs()[0], `bosun: tenant alice: refused download of ${base}/dl (download budget)`);
-    assert.match(String(await next.failure()), /canceled|cancelled/);
+    assert.ok(await refusedAndGone(next));
     assert.equal(svc.manager.sessions.get(id).dlBytes, MB);
     assert.ok(!logs.some((l) => l.includes('shh')), logs.join('\n')); // the query is never logged
     await c.close();
@@ -130,10 +141,30 @@ test('the service-wide budget is shared by the sessions and released when one cl
     await c.call('navigate', { session: b, url: `${base}/` });
     const refused = await grab(svc, c, b, '#small');
     await until(() => budgetLogs()[0], 10000);
-    assert.match(String(await refused.failure()), /canceled|cancelled/);
+    assert.ok(await refusedAndGone(refused));
     assert.equal(svc.manager.sessions.get(b).dlBytes, 0);
     // Closing the first session takes its downloads with it, so the budget frees up again.
     await c.call('session_close', { session: a });
+    assert.equal(svc.manager.dlBytes, 0);
+    await c.close();
+  } finally { await svc.stop(); }
+});
+
+test('a download that finishes after its session closed is not counted against the service budget', async () => {
+  const svc = await startBosun({ DOWNLOADS: '1' });
+  try {
+    const c = await connect(svc, TOKEN);
+    const id = await c.open();
+    const s = svc.manager.sessions.get(id);
+    const file = path.join(tmpDir(), 'late.bin');
+    fs.writeFileSync(file, Buffer.alloc(MB));
+    let finish;
+    const late = { url: () => `${base}/dl?kb=1024`, path: () => new Promise((r) => { finish = r; }), cancel: async () => {}, delete: async () => {} };
+    const counted = svc.manager.onDownload(s, late);
+    await c.call('session_close', { session: id });
+    finish(file); // the download completes only now, after the session (and its share of the budget) is gone
+    await counted;
+    assert.equal(s.dlBytes, 0);
     assert.equal(svc.manager.dlBytes, 0);
     await c.close();
   } finally { await svc.stop(); }

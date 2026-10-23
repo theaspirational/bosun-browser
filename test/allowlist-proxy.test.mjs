@@ -1,5 +1,5 @@
-// Fork: the host allowlist as the per-tenant forward proxy enforces it (src/proxy.mjs) — the layer where the
-// browser's own semantics stay intact. Built from both review rounds' probes: two loopback servers, only the first
+// The host allowlist as the per-tenant forward proxy enforces it (src/proxy.mjs) — the layer where the
+// browser's own semantics stay intact. Built from adversarial review probes: two loopback servers, only the first
 // one allowed, everything driven through the real MCP tools.
 //
 // What each case is about: a redirect chain cannot leave the allowlist (the hop is never sent), neither a page's
@@ -8,10 +8,12 @@
 // that address too (DNS rebinding).
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'fs';
 import http from 'http';
 import zlib from 'zlib';
 import { WebSocketServer } from 'ws';
-import { isPrivateAddress, parseAuthority, resolveTarget } from '../src/proxy.mjs';
+import net from 'net';
+import { isPrivateAddress, parseAuthority, resolveTarget, startTenantProxy } from '../src/proxy.mjs';
 import { parseHostPattern } from '../src/allow.mjs';
 import { startBosun, connect, until, TOKEN, TOKEN_B } from './helpers.mjs';
 
@@ -101,6 +103,8 @@ function deniedServer() {
 const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${srv.address().port}`)));
 const close = (srv) => new Promise((r) => { srv.closeAllConnections(); srv.close(() => r()); });
 const wsOf = (base) => base.replace('http:', 'ws:');
+// What a server was asked for, without the favicon some engines (patchright, camoufox) fetch on their own.
+const asked = (srv) => srv.hits.filter((h) => h !== '/favicon.ico');
 
 let denied, deniedBase, allowed, base, svc, bothSvc, nameSvc, logs, origError;
 before(async () => {
@@ -161,6 +165,73 @@ test('proxy pieces on their own: authority parsing, private addresses, the rebin
   // An address in the allowlist is used as given, with no lookup at all.
   assert.deepEqual(await resolveTarget(allow, '127.0.0.1', 4848, () => { throw new Error('must not resolve'); }), { ip: '127.0.0.1', host: '127.0.0.1', port: 4848 });
   assert.deepEqual(await resolveTarget(allow, 'app.example.org', 443, async () => { throw new Error('nxdomain'); }), { denied: 'could not be resolved' });
+  // Ranges that translate to or stand in for private IPv4: benchmarking, IETF assignments, NAT64, 6to4.
+  for (const ip of ['198.18.0.1', '198.19.255.254', '192.0.0.8', '64:ff9b::a00:1', '64:ff9b:1::1', '2002:a00:1::1']) assert.equal(isPrivateAddress(ip), true, ip);
+  for (const ip of ['198.20.0.1', '192.0.1.1', '2606:4700::1']) assert.equal(isPrivateAddress(ip), false, ip);
+});
+
+test('closing the proxy ends open tunnels and never hangs', async () => {
+  const sink = net.createServer((sock) => { sock.on('error', () => {}); }); // accepts and never answers
+  await new Promise((r) => sink.listen(0, '127.0.0.1', r));
+  const proxy = await startTenantProxy({ tenant: 't', allow: [parseHostPattern(`127.0.0.1:${sink.address().port}`)], log: () => {} });
+  const auth = `Basic ${Buffer.from(`${proxy.username}:${proxy.password}`).toString('base64')}`;
+  const client = net.connect(proxy.port, '127.0.0.1');
+  client.on('error', () => {});
+  client.write(`CONNECT 127.0.0.1:${sink.address().port} HTTP/1.1\r\nProxy-Authorization: ${auth}\r\n\r\n`);
+  await new Promise((r) => client.once('data', r)); // 200 Connection Established: a live tunnel
+  const ended = new Promise((r) => client.once('close', r));
+  const t = Date.now();
+  await proxy.close();
+  await ended;
+  assert.ok(Date.now() - t < 6000, `close took ${Date.now() - t} ms`);
+  await new Promise((r) => sink.close(r));
+});
+
+test('a pooled upstream connection is tracked once, however many requests reuse it', async () => {
+  const up = http.createServer((_q, r) => { r.writeHead(200, { 'content-type': 'text/plain' }); r.end('ok'); });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const port = up.address().port;
+  const proxy = await startTenantProxy({ tenant: 't', allow: [parseHostPattern(`127.0.0.1:${port}`)], log: () => {} });
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  const warnings = [];
+  const onWarning = (w) => warnings.push(w.name);
+  process.on('warning', onWarning);
+  try {
+    for (let i = 0; i < 20; i++) {
+      await new Promise((resolve, reject) => {
+        http.get({ host: '127.0.0.1', port: proxy.port, path: `http://127.0.0.1:${port}/${i}`, agent,
+          headers: { 'proxy-authorization': `Basic ${Buffer.from(`${proxy.username}:${proxy.password}`).toString('base64')}` } },
+        (res) => { res.resume(); res.on('end', resolve); }).on('error', reject);
+      });
+    }
+    await new Promise((r) => setTimeout(r, 50));
+    assert.ok(!warnings.includes('MaxListenersExceededWarning'), warnings.join());
+  } finally {
+    process.off('warning', onWarning);
+    agent.destroy();
+    await proxy.close();
+    await new Promise((r) => { up.closeAllConnections(); up.close(() => r()); });
+  }
+});
+
+test('a request whose DNS answer arrives after close() never reaches upstream', async () => {
+  let connections = 0;
+  const sink = net.createServer((sock) => { connections++; sock.destroy(); });
+  await new Promise((r) => sink.listen(0, '127.0.0.1', r));
+  const port = sink.address().port;
+  const answers = [];
+  const lookup = () => new Promise((r) => answers.push(r)); // answered by hand, after close()
+  const proxy = await startTenantProxy({ tenant: 't', allow: [parseHostPattern(`app.example.org:${port}`), parseHostPattern(`127.0.0.1:${port}`)], log: () => {}, lookup });
+  const auth = `Basic ${Buffer.from(`${proxy.username}:${proxy.password}`).toString('base64')}`;
+  const send = (text) => { const c = net.connect(proxy.port, '127.0.0.1'); c.on('error', () => {}); c.write(text); return c; };
+  send(`CONNECT app.example.org:${port} HTTP/1.1\r\nProxy-Authorization: ${auth}\r\n\r\n`);
+  send(`GET http://app.example.org:${port}/ HTTP/1.1\r\nHost: app.example.org:${port}\r\nProxy-Authorization: ${auth}\r\n\r\n`);
+  await until(() => answers.length === 2, 5000);
+  await proxy.close();
+  for (const answer of answers) answer('127.0.0.1');
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(connections, 0);
+  await new Promise((r) => sink.close(r));
 });
 
 test('navigate: refused before anything is opened, and the allowed hosts are named in the tool description', async () => {
@@ -214,7 +285,7 @@ test('an allowed redirect chain is followed by the browser, with its own URL and
     assert.equal(r.json().status, 200);
     assert.equal(r.json().url, `${base}/deep/landed`); // the tab is where it really landed
     assert.equal(r.json().refused, undefined);
-    assert.deepEqual(allowed.hits, ['/hop1', '/hop2', '/deep/landed', '/deep/pixel.png']);
+    assert.deepEqual(asked(allowed), ['/hop1', '/hop2', '/deep/landed', '/deep/pixel.png']);
     assert.match(await read(c, s), /cookie=hop=1/);
     assert.equal(await until(() => outcome(c, s), 5000), 'img-ok'); // relative to the real URL, natively
     assert.equal(denials().length, before);
@@ -246,8 +317,13 @@ test('a subresource, and a subresource redirect, cannot leave the allowlist', as
   } finally { await c.close(); }
 });
 
+// Playwright's Firefox driver hits an internal assertion on a worker's WebSocket events. The service survives it
+// (test/driver-errors.test.mjs), but node:test fails any file in which it happens, so the worker cases are not run
+// in-process on camoufox.
+const FF_WORKER_WS = process.env.ENGINE === 'camoufox' && 'worker WebSockets trip a Playwright Firefox driver assertion (see test/driver-errors.test.mjs)';
+
 for (const worker of [false, true]) {
-  test(`a WebSocket from ${worker ? 'a Blob worker' : 'the page'} is allowed only where the allowlist allows it`, async () => {
+  test(`a WebSocket from ${worker ? 'a Blob worker' : 'the page'} is allowed only where the allowlist allows it`, { skip: worker && FF_WORKER_WS }, async () => {
     const c = await connect(svc, TOKEN);
     try {
       const s = await c.open();
@@ -296,13 +372,44 @@ test('a name that resolves into a private address is refused unless the allowlis
     assert.equal(r.isError, false, r.text);
     assert.equal(r.json().status, 403, r.text);
     assert.ok(!(await read(c, s)).includes('allowed'), 'the page behind the private address was served');
-    assert.equal(await refusals(nameSvc), 1);
+    assert.ok(await refusals(nameSvc) >= 1); // the page itself, and its favicon on engines that fetch one
     const line = await until(() => denials().find((l) => l.includes('localhost:')), 5000);
     assert.match(line, /^bosun: tenant alice: blocked localhost:\d+ — resolves into a private address the allowlist does not name$/);
     // The address form is not in this allowlist either, so it is refused one step earlier.
     const direct = await c.call('navigate', { session: s, url: `${base}/` });
     assert.equal(direct.isError, true);
     assert.match(direct.text, /is not in the host allowlist of this token/);
+  } finally { await c.close(); }
+});
+
+test('a redirect to https outside the allowlist is refused at CONNECT, and navigate says so', async () => {
+  const c = await connect(svc, TOKEN);
+  try {
+    const s = await c.open();
+    denied.hits.length = 0;
+    const before = await refusals();
+    const to = `https://127.0.0.1:${deniedPort()}/tls?secret=shh`;
+    const r = await c.call('navigate', { session: s, url: `${base}/redirect?code=302&to=${encodeURIComponent(to)}` });
+    assert.equal(r.isError, true, r.text);
+    assert.match(r.text, new RegExp(`refused by the host allowlist of this token: 127\\.0\\.0\\.1:${deniedPort()}`));
+    assert.ok(!r.text.includes('shh'), r.text);
+    assert.deepEqual(denied.hits, []);
+    assert.ok(await refusals() > before);
+  } finally { await c.close(); }
+});
+
+test('a proxied tenant\'s sessions run in browsers of their own, which go with the session', async () => {
+  const c = await connect(svc, TOKEN);
+  try {
+    const a = await c.open();
+    const b = await c.open();
+    const [sa, sb] = [svc.manager.sessions.get(a), svc.manager.sessions.get(b)];
+    assert.equal(sa.browser, null); // never the shared browser
+    assert.ok(sa.tmpDir && sb.tmpDir && sa.tmpDir !== sb.tmpDir);
+    assert.equal((await c.call('navigate', { session: a, url: `${base}/` })).json().title, 'Allowed');
+    await c.call('session_close', { session: a });
+    await until(() => !fs.existsSync(sa.tmpDir), 15000); // its browser is gone, and its profile with it
+    assert.equal((await c.call('navigate', { session: b, url: `${base}/` })).json().title, 'Allowed');
   } finally { await c.close(); }
 });
 
@@ -326,9 +433,10 @@ test('a tenant without an allowlist gets no proxy and keeps upstream behaviour',
     const r = await c.call('navigate', { session: s, url: `${deniedBase}/anywhere` });
     assert.equal(r.isError, false, r.text);
     assert.equal(r.json().status, 200);
-    assert.deepEqual(denied.hits, ['/anywhere']);
-    await c.call('navigate', { session: s, url: `${base}/ws?worker=1&to=${encodeURIComponent(`${wsOf(deniedBase)}/sock`)}` });
-    assert.equal(await until(() => outcome(c, s), 10000), 'worker ws message from-denied');
+    assert.deepEqual(asked(denied), ['/anywhere']);
+    const worker = FF_WORKER_WS ? '0' : '1';
+    await c.call('navigate', { session: s, url: `${base}/ws?worker=${worker}&to=${encodeURIComponent(`${wsOf(deniedBase)}/sock`)}` });
+    assert.equal(await until(() => outcome(c, s), 10000), `${FF_WORKER_WS ? '' : 'worker '}ws message from-denied`);
     const nav = (await c.listTools()).tools.find((t) => t.name === 'navigate');
     assert.equal(nav.description, 'Go to a URL (http/https only).');
   } finally { await c.close(); }
